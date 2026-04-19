@@ -108,11 +108,16 @@ type OIDCController struct {
 	cfg *OIDCConfig
 
 	// provider is initialized lazily — a transient IdP outage at boot must not
-	// permanently disable SSO. Subsequent login attempts retry discovery.
-	provMu   sync.Mutex
-	provider *oidc.Provider
-	verifier *oidc.IDTokenVerifier
-	oauthCfg *oauth2.Config
+	// permanently disable SSO. Subsequent login attempts retry discovery, but
+	// a failed discovery is cached for a short TTL to prevent amplifying load
+	// on the IdP when /oidc/login is hit in a tight loop.
+	provMu        sync.Mutex
+	provider      *oidc.Provider
+	verifier      *oidc.IDTokenVerifier
+	oauthCfg      *oauth2.Config
+	lastDiscErr   error
+	lastDiscErrAt time.Time
+	discoNegTTL   time.Duration
 
 	userService    service.UserService
 	settingService service.SettingService
@@ -127,26 +132,48 @@ func NewOIDCController(g *gin.RouterGroup) *OIDCController {
 	if cfg == nil {
 		return nil
 	}
-	c := &OIDCController{cfg: cfg}
+	// Loud warning if the configured redirect URL is http:// on a non-local
+	// host — every OIDC temp cookie will then be sent without Secure, so a
+	// network attacker can read the state/nonce/PKCE values. This is almost
+	// always a misconfiguration (intended deployment is behind TLS).
+	if strings.HasPrefix(strings.ToLower(cfg.RedirectURL), "http://") {
+		if !strings.Contains(cfg.RedirectURL, "://localhost") &&
+			!strings.Contains(cfg.RedirectURL, "://127.0.0.1") &&
+			!strings.Contains(cfg.RedirectURL, "://[::1]") {
+			logger.Errorf("OIDC: XUI_OIDC_REDIRECT_URL is http:// on a non-local host (%q); "+
+				"state/nonce/PKCE cookies will NOT have the Secure flag. "+
+				"Deploy behind TLS and set the redirect URL to https://.", cfg.RedirectURL)
+		}
+	}
+	c := &OIDCController{cfg: cfg, discoNegTTL: 30 * time.Second}
 	g.GET("/oidc/login", c.login)
 	g.GET("/oidc/callback", c.callback)
 	logger.Infof("OIDC: enabled for issuer %q client %q", cfg.Issuer, cfg.ClientID)
 	return c
 }
 
-// ensureProvider lazily runs OIDC discovery and caches the result.
+// ensureProvider lazily runs OIDC discovery and caches the result. On failure,
+// the error is cached for discoNegTTL so a crashed IdP cannot be amplified
+// into a sustained stream of 10-second blocking discovery calls from any
+// unauthenticated HTTP client hitting /oidc/login.
 func (a *OIDCController) ensureProvider(ctx context.Context) error {
 	a.provMu.Lock()
 	defer a.provMu.Unlock()
 	if a.provider != nil {
 		return nil
 	}
+	if a.lastDiscErr != nil && time.Since(a.lastDiscErrAt) < a.discoNegTTL {
+		return a.lastDiscErr
+	}
 	discCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	provider, err := oidc.NewProvider(discCtx, a.cfg.Issuer)
 	if err != nil {
+		a.lastDiscErr = err
+		a.lastDiscErrAt = time.Now()
 		return err
 	}
+	a.lastDiscErr = nil
 	a.provider = provider
 	a.verifier = provider.Verifier(&oidc.Config{
 		ClientID:             a.cfg.ClientID,
@@ -267,7 +294,11 @@ func (a *OIDCController) callback(c *gin.Context) {
 				errors.New("claim "+a.cfg.UsernameClaim+" had unsupported type or was empty"))
 			return
 		}
-		fallbackUsername = s
+		fallbackUsername = sanitizeUsername(s)
+		if fallbackUsername == "" {
+			a.fail(c, http.StatusBadGateway, "SSO claim contains only disallowed characters", nil)
+			return
+		}
 	}
 
 	emailClaim, _ := claims["email"].(string)
@@ -436,6 +467,26 @@ func clearTempCookie(c *gin.Context, name string, secure bool) {
 func claimsIndicateEmail(claim string) bool {
 	c := strings.ToLower(claim)
 	return c == "email" || strings.HasSuffix(c, "_email") || c == "mail"
+}
+
+// sanitizeUsername strips control characters and caps length so a malicious
+// IdP claim cannot inject newlines/ANSI sequences into logs and Telegram
+// messages (which get rendered with MarkdownV2 / arbitrary consumer parsers).
+// Returns an empty string when nothing printable remains.
+func sanitizeUsername(s string) string {
+	const maxLen = 128
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch < 0x20 || ch == 0x7f {
+			continue // skip C0 and DEL
+		}
+		b = append(b, ch)
+		if len(b) >= maxLen {
+			break
+		}
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // toBool accepts boolean claims in both real-bool form and the string form

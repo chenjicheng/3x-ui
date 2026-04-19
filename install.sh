@@ -932,6 +932,18 @@ configure_sso() {
         _read_or_exit api_key "Pocket-ID STATIC_API_KEY: " silent || return 1
     done
 
+    # Allow operator to pick which IdToken claim becomes the panel username.
+    # Default is `email`, which is what Pocket-ID emits. Accepting others
+    # (preferred_username, sub) is useful for Keycloak/Azure deployments.
+    local username_claim=""
+    _read_or_exit username_claim "Username claim to read from id_token [email]: " || return 1
+    username_claim="${username_claim// /}"
+    [[ -z "$username_claim" ]] && username_claim="email"
+    if ! [[ "$username_claim" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo -e "${red}Invalid claim name '${username_claim}'; expected [A-Za-z0-9_.-]+.${plain}"
+        return 1
+    fi
+
     # Pass the API key via curl --config so it doesn't appear in /proc/*/cmdline.
     # Escape backslashes and double quotes in the key per curl's -K double-quoted
     # value grammar.
@@ -1050,7 +1062,7 @@ configure_sso() {
         printf 'XUI_OIDC_CLIENT_ID=%s\n'      "$(_systemd_env_escape "$client_id")"
         printf 'XUI_OIDC_CLIENT_SECRET=%s\n'  "$(_systemd_env_escape "$secret")"
         printf 'XUI_OIDC_REDIRECT_URL=%s\n'   "$(_systemd_env_escape "$callback")"
-        printf 'XUI_OIDC_USERNAME_CLAIM=%s\n' "$(_systemd_env_escape "email")"
+        printf 'XUI_OIDC_USERNAME_CLAIM=%s\n' "$(_systemd_env_escape "$username_claim")"
         # Keep both behaviors OFF by default. See docs for why.
         printf 'XUI_OIDC_AUTO_CREATE=%s\n'              "$(_systemd_env_escape "false")"
         printf 'XUI_OIDC_ALLOW_USERNAME_BACKFILL=%s\n'  "$(_systemd_env_escape "false")"
@@ -1059,8 +1071,10 @@ configure_sso() {
     mv -f "$env_tmp" "$env_file"
     chmod 600 "$env_file"
 
-    # Restart and verify the service came back healthy. A silent restart failure
-    # (bad env format, port conflict, etc.) would look like success to the user.
+    # Restart and poll for the service to become active. systemctl restart
+    # returns as soon as the transaction is queued, not once ExecStart is
+    # actually ready, so a one-shot `is-active` immediately after can miss
+    # a slow startup (Go binary + sqlite + TLS listener).
     local restart_ok=1
     if [[ "${release}" == "alpine" ]]; then
         rc-service x-ui restart >/dev/null 2>&1 || restart_ok=0
@@ -1068,15 +1082,18 @@ configure_sso() {
         systemctl restart x-ui >/dev/null 2>&1 || restart_ok=0
     fi
 
-    sleep 1
     local active=0
-    if [[ "${release}" == "alpine" ]]; then
-        rc-service x-ui status >/dev/null 2>&1 && active=1
-    else
-        systemctl is-active --quiet x-ui && active=1
-    fi
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if [[ "${release}" == "alpine" ]]; then
+            rc-service x-ui status >/dev/null 2>&1 && { active=1; break; }
+        else
+            systemctl is-active --quiet x-ui && { active=1; break; }
+        fi
+        sleep 1
+    done
     if [[ "$active" -ne 1 || "$restart_ok" -ne 1 ]]; then
-        echo -e "${red}x-ui failed to come back up after SSO config write.${plain}"
+        echo -e "${red}x-ui failed to come back up after SSO config write (waited 10s).${plain}"
         echo -e "${red}Inspect logs: journalctl -u x-ui -n 100  (or  rc-service x-ui status).${plain}"
         return 1
     fi
@@ -1088,9 +1105,11 @@ configure_sso() {
     echo -e "${green}Client ID:   ${client_id}${plain}"
     echo -e "${green}Callback:    ${callback}${plain}"
     echo -e "${green}Env file:    ${env_file}${plain}"
-    echo -e "${yellow}First SSO login needs to match the current admin username (email-based${plain}"
-    echo -e "${yellow}backfill is enabled). Disable 2FA on the panel first — SSO is blocked${plain}"
-    echo -e "${yellow}while TOTP 2FA is active to prevent bypassing it.${plain}"
+    echo -e "${yellow}To let SSO log in to an existing panel account, edit ${env_file} and${plain}"
+    echo -e "${yellow}set XUI_OIDC_ALLOW_USERNAME_BACKFILL=true (safer: only match the claim${plain}"
+    echo -e "${yellow}on the account with matching email). Backfill is OFF by default.${plain}"
+    echo -e "${yellow}Disable panel 2FA before using SSO — SSO is blocked while TOTP 2FA is${plain}"
+    echo -e "${yellow}active to prevent bypassing it.${plain}"
     echo -e "${green}═══════════════════════════════════════════${plain}"
 }
 

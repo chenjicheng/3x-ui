@@ -179,7 +179,10 @@ jobs:
           file: x-ui-linux-${{ matrix.platform }}.tar.gz
           asset_name: x-ui-linux-${{ matrix.platform }}.tar.gz
           overwrite: true
-          prerelease: true
+          # Not a prerelease: install.sh and update.sh fetch /releases/latest
+          # which skips prereleases. Marking SSO builds as prerelease would
+          # make them silently invisible to the installer.
+          prerelease: false
 
   # =================================
   #  Windows Build
@@ -275,4 +278,4 @@ jobs:
           file: x-ui-windows-amd64.zip
           asset_name: x-ui-windows-amd64.zip
           overwrite: true
-          prerelease: true
+          prerelease: false

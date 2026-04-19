@@ -184,12 +184,16 @@ func (s *UserService) GetOrLinkOIDCUser(subject string, fallbackUsername string,
 				if byName.OIDCSubject != nil && *byName.OIDCSubject != "" && *byName.OIDCSubject != subject {
 					return errors.New("username already bound to a different SSO identity")
 				}
-				sub := subject
-				byName.OIDCSubject = &sub
-				if err := tx.Save(byName).Error; err != nil {
+				// Update only the one column so a concurrent password change on
+				// the same row isn't clobbered by a stale full-struct write.
+				if err := tx.Model(&model.User{}).
+					Where("id = ?", byName.Id).
+					Update("oidc_subject", subject).Error; err != nil {
 					logger.Warning("oidc subject backfill err:", err)
 					return err
 				}
+				sub := subject
+				byName.OIDCSubject = &sub
 				result = byName
 				return nil
 			}
