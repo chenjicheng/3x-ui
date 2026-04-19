@@ -101,6 +101,7 @@
 "hello" = "Hello"
 "title" = "Welcome"
 "loginAgain" = "Your session has expired, please log in again"
+"ssoLogin" = "Sign in with SSO"
 
 [pages.login.toasts]
 "invalidFormData" = "The Input data format is invalid."

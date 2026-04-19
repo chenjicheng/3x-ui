@@ -90,6 +90,18 @@
                         </div>
                       </a-row>
                     </a-form-item>
+                    {{ if .oidc_enabled }}
+                    <a-form-item>
+                      <a-row justify="center" class="centered">
+                        <a href="{{ .base_path }}oidc/login"
+                           class="ant-btn ant-btn-primary ant-btn-lg ant-btn-block"
+                           style="display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%;">
+                          <i class="anticon anticon-safety-certificate"></i>
+                          <span>{{ i18n "pages.login.ssoLogin" }}</span>
+                        </a>
+                      </a-row>
+                    </a-form-item>
+                    {{ end }}
                   </a-space>
                 </a-form>
               </a-col>

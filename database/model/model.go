@@ -28,6 +28,9 @@ type User struct {
 	Id       int    `json:"id" gorm:"primaryKey;autoIncrement"`
 	Username string `json:"username"`
 	Password string `json:"password"`
+	// OIDCSubject is the OIDC `sub` claim that binds this user to an SSO identity.
+	// Empty for password-only accounts. Stable across IdP-side email/username changes.
+	OIDCSubject string `json:"-" gorm:"uniqueIndex;default:null"`
 }
 
 // Inbound represents an Xray inbound configuration with traffic statistics and settings.

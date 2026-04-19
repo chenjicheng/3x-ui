@@ -1,6 +1,8 @@
 package service
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -124,6 +126,81 @@ func (s *UserService) UpdateUser(id int, username string, password string) error
 		Where("id = ?", id).
 		Updates(map[string]any{"username": username, "password": hashedPassword}).
 		Error
+}
+
+// GetOrLinkOIDCUser resolves the local user bound to the given OIDC subject.
+//
+// The lookup is in three steps:
+//  1. Match an existing user whose oidc_subject equals `subject` (stable across IdP email changes).
+//  2. Fall back to matching an existing user whose username equals `fallbackUsername` AND whose
+//     oidc_subject is empty. This is the one-time migration for admins who signed up with
+//     password auth before SSO was enabled; the subject is backfilled on that row.
+//  3. If autoCreate is true and no match is found, a new user is created with Username =
+//     fallbackUsername, OIDCSubject = subject, and a random password (effectively SSO-only).
+//
+// Returns an error when no match is found and autoCreate is false, or when the fallback
+// username exists but is already bound to a different OIDC subject (prevents takeover).
+func (s *UserService) GetOrLinkOIDCUser(subject string, fallbackUsername string, autoCreate bool) (*model.User, error) {
+	if subject == "" {
+		return nil, errors.New("empty oidc subject")
+	}
+	db := database.GetDB()
+
+	user := &model.User{}
+	err := db.Model(&model.User{}).Where("oidc_subject = ?", subject).First(user).Error
+	if err == nil {
+		return user, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		logger.Warning("oidc user lookup by subject err:", err)
+		return nil, err
+	}
+
+	if fallbackUsername != "" {
+		byName := &model.User{}
+		err = db.Model(&model.User{}).Where("username = ?", fallbackUsername).First(byName).Error
+		if err == nil {
+			if byName.OIDCSubject != "" && byName.OIDCSubject != subject {
+				return nil, errors.New("username already bound to a different SSO identity")
+			}
+			byName.OIDCSubject = subject
+			if err := db.Save(byName).Error; err != nil {
+				logger.Warning("oidc subject backfill err:", err)
+				return nil, err
+			}
+			return byName, nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			logger.Warning("oidc user lookup by username err:", err)
+			return nil, err
+		}
+	}
+
+	if !autoCreate {
+		return nil, errors.New("no local account bound to this SSO identity")
+	}
+
+	pwBytes := make([]byte, 24)
+	if _, rerr := rand.Read(pwBytes); rerr != nil {
+		return nil, rerr
+	}
+	randomPassword := base64.RawURLEncoding.EncodeToString(pwBytes)
+	hashed, herr := crypto.HashPasswordAsBcrypt(randomPassword)
+	if herr != nil {
+		return nil, herr
+	}
+	newUser := &model.User{
+		Username:    fallbackUsername,
+		Password:    hashed,
+		OIDCSubject: subject,
+	}
+	if newUser.Username == "" {
+		newUser.Username = "sso-" + subject
+	}
+	if err := db.Create(newUser).Error; err != nil {
+		return nil, err
+	}
+	return newUser, nil
 }
 
 func (s *UserService) UpdateFirstUser(username string, password string) error {

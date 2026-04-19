@@ -52,7 +52,9 @@ func (a *IndexController) index(c *gin.Context) {
 		c.Redirect(http.StatusTemporaryRedirect, "panel/")
 		return
 	}
-	html(c, "login.html", "pages.login.title", nil)
+	html(c, "login.html", "pages.login.title", gin.H{
+		"oidc_enabled": OIDCEnabled(),
+	})
 }
 
 // login handles user authentication and session creation.

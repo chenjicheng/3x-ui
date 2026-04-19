@@ -3,6 +3,7 @@ module github.com/mhsanaei/3x-ui/v2
 go 1.26.1
 
 require (
+	github.com/coreos/go-oidc/v3 v3.18.0
 	github.com/gin-contrib/gzip v1.2.6
 	github.com/gin-contrib/sessions v1.1.0
 	github.com/gin-gonic/gin v1.12.0
@@ -24,6 +25,7 @@ require (
 	github.com/xtls/xray-core v1.260327.0
 	go.uber.org/atomic v1.11.0
 	golang.org/x/crypto v0.49.0
+	golang.org/x/oauth2 v0.36.0
 	golang.org/x/sys v0.42.0
 	golang.org/x/text v0.35.0
 	google.golang.org/grpc v1.80.0
@@ -45,6 +47,7 @@ require (
 	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
 	github.com/gin-contrib/sse v1.1.1 // indirect
 	github.com/go-asn1-ber/asn1-ber v1.5.8-0.20250403174932-29230038a667 // indirect
+	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
