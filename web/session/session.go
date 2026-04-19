@@ -31,14 +31,17 @@ func SetLoginUser(c *gin.Context, user *model.User) {
 	s.Set(loginUserKey, *user)
 }
 
-// SetMaxAge configures the session cookie maximum age in seconds.
-// This controls how long the session remains valid before requiring re-authentication.
-func SetMaxAge(c *gin.Context, maxAge int) {
+// SetMaxAge configures the session cookie maximum age in seconds and whether
+// the cookie is marked Secure. Callers pass secure=true when the request was
+// served over TLS (or a trusted reverse proxy indicates TLS upstream) so the
+// session cookie cannot leak over plain HTTP.
+func SetMaxAge(c *gin.Context, maxAge int, secure bool) {
 	s := sessions.Default(c)
 	s.Options(sessions.Options{
 		Path:     defaultPath,
 		MaxAge:   maxAge,
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }

@@ -3,6 +3,7 @@ package controller
 import (
 	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/mhsanaei/3x-ui/v2/config"
@@ -110,4 +111,20 @@ func getContext(h gin.H) gin.H {
 // isAjax checks if the request is an AJAX request.
 func isAjax(c *gin.Context) bool {
 	return c.GetHeader("X-Requested-With") == "XMLHttpRequest"
+}
+
+// requestIsSecure reports whether the current request was served over HTTPS
+// (direct TLS listener or a trusted proxy forwarding it). Honors
+// X-Forwarded-Proto only when XUI_OIDC_TRUST_FORWARDED_PROTO=true, matching
+// the same knob used by the OIDC controller.
+func requestIsSecure(c *gin.Context) bool {
+	if c.Request.TLS != nil {
+		return true
+	}
+	if v := strings.TrimSpace(os.Getenv("XUI_OIDC_TRUST_FORWARDED_PROTO")); v != "" {
+		if strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes") {
+			return strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+		}
+	}
+	return false
 }

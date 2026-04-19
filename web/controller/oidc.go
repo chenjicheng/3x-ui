@@ -285,6 +285,15 @@ func (a *OIDCController) callback(c *gin.Context) {
 		a.fail(c, http.StatusBadGateway, "SSO id_token has empty sub", nil)
 		return
 	}
+	// OIDC `sub` is opaque and must be preserved byte-for-byte for DB lookups,
+	// so we cannot truncate it. Cap length instead; a pathologically long
+	// subject is either a misconfigured/compromised IdP or an attack to bloat
+	// log files and the users table.
+	const maxSubjectLen = 255
+	if len(subject) > maxSubjectLen {
+		a.fail(c, http.StatusBadGateway, "SSO id_token sub is too long", nil)
+		return
+	}
 	// Strictly extract the configured username claim.
 	var fallbackUsername string
 	if v, present := claims[a.cfg.UsernameClaim]; present {
@@ -392,7 +401,7 @@ func (a *OIDCController) callback(c *gin.Context) {
 		}
 		sessionMaxAge = 60 // minutes
 	}
-	session.SetMaxAge(c, sessionMaxAge*60)
+	session.SetMaxAge(c, sessionMaxAge*60, a.isSecureRequest(c))
 	session.SetLoginUser(c, user)
 	if err := s.Save(); err != nil {
 		logger.Warning("OIDC: unable to save session:", err)

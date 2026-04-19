@@ -1105,9 +1105,20 @@ configure_sso() {
     echo -e "${green}Client ID:   ${client_id}${plain}"
     echo -e "${green}Callback:    ${callback}${plain}"
     echo -e "${green}Env file:    ${env_file}${plain}"
-    echo -e "${yellow}To let SSO log in to an existing panel account, edit ${env_file} and${plain}"
-    echo -e "${yellow}set XUI_OIDC_ALLOW_USERNAME_BACKFILL=true (safer: only match the claim${plain}"
-    echo -e "${yellow}on the account with matching email). Backfill is OFF by default.${plain}"
+    echo -e "${yellow}To let SSO log in to an existing panel account:${plain}"
+    echo -e "${yellow}  1. edit ${env_file}${plain}"
+    echo -e "${yellow}  2. set XUI_OIDC_ALLOW_USERNAME_BACKFILL=true${plain}"
+    if [[ "$username_claim" == "email" ]]; then
+        echo -e "${yellow}  3. systemctl restart x-ui${plain}"
+        echo -e "${yellow}SSO will then bind to the existing admin whose username matches the${plain}"
+        echo -e "${yellow}IdP's verified email claim.${plain}"
+    else
+        echo -e "${yellow}  3. also set XUI_OIDC_ALLOWED_SUBJECTS=<your sub> OR${plain}"
+        echo -e "${yellow}     XUI_OIDC_ALLOWED_EMAILS=<your email>${plain}"
+        echo -e "${yellow}  4. systemctl restart x-ui${plain}"
+        echo -e "${yellow}Using a non-email claim (${username_claim}) requires an allow-list to${plain}"
+        echo -e "${yellow}block IdP users from self-picking someone else's username.${plain}"
+    fi
     echo -e "${yellow}Disable panel 2FA before using SSO — SSO is blocked while TOTP 2FA is${plain}"
     echo -e "${yellow}active to prevent bypassing it.${plain}"
     echo -e "${green}═══════════════════════════════════════════${plain}"
