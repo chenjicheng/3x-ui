@@ -119,7 +119,7 @@ func (a *IndexController) logout(c *gin.Context) {
 	if user != nil {
 		logger.Infof("%s logged out successfully", user.Username)
 	}
-	session.ClearSession(c)
+	session.ClearSession(c, requestIsSecure(c))
 	if err := sessions.Default(c).Save(); err != nil {
 		logger.Warning("Unable to save session after clearing:", err)
 	}

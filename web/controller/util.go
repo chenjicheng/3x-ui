@@ -113,17 +113,31 @@ func isAjax(c *gin.Context) bool {
 	return c.GetHeader("X-Requested-With") == "XMLHttpRequest"
 }
 
-// requestIsSecure reports whether the current request was served over HTTPS
-// (direct TLS listener or a trusted proxy forwarding it). Honors
-// X-Forwarded-Proto only when XUI_OIDC_TRUST_FORWARDED_PROTO=true, matching
-// the same knob used by the OIDC controller.
+// requestIsSecure reports whether the current request was served over HTTPS.
+//
+// Order of checks:
+//  1. Direct TLS listener (Go saw the handshake).
+//  2. X-Forwarded-Proto = https when XUI_OIDC_TRUST_FORWARDED_PROTO is opted in
+//     (so an arbitrary client cannot flip the flag by spoofing a header).
+//  3. When OIDC is configured with an https:// redirect URL, treat the request
+//     as secure. The redirect URL is operator-supplied and is the ground truth
+//     for the deployment's TLS posture, so this is safer than sniffing client
+//     headers. This lets a panel behind a TLS-terminating reverse proxy get
+//     Secure-flagged session cookies even without the env knob flipped.
 func requestIsSecure(c *gin.Context) bool {
 	if c.Request.TLS != nil {
 		return true
 	}
 	if v := strings.TrimSpace(os.Getenv("XUI_OIDC_TRUST_FORWARDED_PROTO")); v != "" {
 		if strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes") {
-			return strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
+			if strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https") {
+				return true
+			}
+		}
+	}
+	if redirect := strings.TrimSpace(os.Getenv("XUI_OIDC_REDIRECT_URL")); redirect != "" {
+		if strings.HasPrefix(strings.ToLower(redirect), "https://") {
+			return true
 		}
 	}
 	return false

@@ -71,13 +71,16 @@ func IsLogin(c *gin.Context) bool {
 
 // ClearSession removes all session data and invalidates the session.
 // This effectively logs out the user and clears any stored session information.
-func ClearSession(c *gin.Context) {
+// secure should match the Secure flag used when the session was originally
+// written, so the logout Set-Cookie attributes agree with the original cookie.
+func ClearSession(c *gin.Context, secure bool) {
 	s := sessions.Default(c)
 	s.Clear()
 	s.Options(sessions.Options{
 		Path:     defaultPath,
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
 }

@@ -426,19 +426,10 @@ func (a *OIDCController) fail(c *gin.Context, status int, publicMsg string, deta
 }
 
 // isSecureRequest decides whether to set the Secure flag on OIDC temp cookies.
-// Honors X-Forwarded-Proto only if XUI_OIDC_TRUST_FORWARDED_PROTO=true, so an
-// untrusted client can't flip the Secure flag by spoofing a header.
+// Delegates to the shared requestIsSecure helper so password-login and OIDC
+// paths agree on the per-request answer for the same panel deployment.
 func (a *OIDCController) isSecureRequest(c *gin.Context) bool {
-	if c.Request.TLS != nil {
-		return true
-	}
-	if boolEnv("XUI_OIDC_TRUST_FORWARDED_PROTO", false) {
-		return strings.EqualFold(c.GetHeader("X-Forwarded-Proto"), "https")
-	}
-	// Panel deployed behind a reverse proxy where the callback URL is https —
-	// infer from the configured redirect URL's scheme rather than sniffing
-	// client-supplied headers.
-	return strings.HasPrefix(strings.ToLower(a.cfg.RedirectURL), "https://")
+	return requestIsSecure(c)
 }
 
 func randString(n int) (string, error) {
