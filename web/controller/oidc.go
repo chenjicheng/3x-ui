@@ -30,14 +30,16 @@ const (
 
 // OIDCConfig is the runtime OIDC configuration assembled from env vars.
 //
-// 3x-ui is a single-admin panel: there is one local admin row, period. SSO
-// does not create, link, or back-fill users — a successful SSO authentication
-// simply grants a session that acts AS that single admin. The admin's
-// username/password stays as an emergency fallback.
+// 3x-ui is a single-admin panel. SSO does not create, link, or back-fill users
+// — a successful SSO authentication simply grants a session that acts AS the
+// single admin. The admin's username/password stays as an emergency fallback.
 //
-// Security therefore rests entirely on "who is allowed to complete SSO?". At
-// least one of AllowedSubjects / AllowedEmails must be non-empty; otherwise
-// LoadOIDCConfig returns nil and SSO is disabled at startup.
+// Access policy is trust-on-first-use: the first SSO identity to pass auth
+// has its `sub` recorded in the panel database (via SettingService), and
+// every later login must match that sub. The operator is expected to be the
+// one who clicks "Sign in with SSO" first — or, even safer, to restrict the
+// Pocket-ID OIDC Client to their own User Group so only they can ever reach
+// the callback.
 type OIDCConfig struct {
 	Issuer        string
 	ClientID      string
@@ -46,8 +48,6 @@ type OIDCConfig struct {
 	UsernameClaim string
 
 	RequireEmailVerified bool
-	AllowedSubjects      map[string]struct{}
-	AllowedEmails        map[string]struct{}
 }
 
 func boolEnv(name string, defaultVal bool) bool {
@@ -58,32 +58,8 @@ func boolEnv(name string, defaultVal bool) bool {
 	return strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes")
 }
 
-// setEnv parses a comma-separated env var into a lookup set. lowercase=true
-// for case-insensitive matches (e.g. emails); false for OIDC subjects, which
-// RFC 7519 defines as opaque case-sensitive strings.
-func setEnv(name string, lowercase bool) map[string]struct{} {
-	raw := strings.TrimSpace(os.Getenv(name))
-	if raw == "" {
-		return nil
-	}
-	out := make(map[string]struct{})
-	for _, p := range strings.Split(raw, ",") {
-		p = strings.TrimSpace(p)
-		if lowercase {
-			p = strings.ToLower(p)
-		}
-		if p != "" {
-			out[p] = struct{}{}
-		}
-	}
-	return out
-}
-
-// LoadOIDCConfig reads XUI_OIDC_* env vars. Returns nil when any required
-// field is missing — required = issuer + client id + secret + redirect URL,
-// PLUS at least one allow-list entry (subjects or emails). Without an
-// allow-list, any IdP user would gain admin access, so we refuse to start
-// SSO in that state.
+// LoadOIDCConfig reads XUI_OIDC_* env vars. Returns nil when any of the four
+// required fields (issuer, client id, secret, redirect URL) is unset.
 func LoadOIDCConfig() *OIDCConfig {
 	c := &OIDCConfig{
 		Issuer:               strings.TrimSpace(os.Getenv("XUI_OIDC_ISSUER")),
@@ -92,15 +68,8 @@ func LoadOIDCConfig() *OIDCConfig {
 		RedirectURL:          strings.TrimSpace(os.Getenv("XUI_OIDC_REDIRECT_URL")),
 		UsernameClaim:        strings.TrimSpace(os.Getenv("XUI_OIDC_USERNAME_CLAIM")),
 		RequireEmailVerified: boolEnv("XUI_OIDC_REQUIRE_EMAIL_VERIFIED", true),
-		AllowedSubjects:      setEnv("XUI_OIDC_ALLOWED_SUBJECTS", false),
-		AllowedEmails:        setEnv("XUI_OIDC_ALLOWED_EMAILS", true),
 	}
 	if c.Issuer == "" || c.ClientID == "" || c.ClientSecret == "" || c.RedirectURL == "" {
-		return nil
-	}
-	if len(c.AllowedSubjects) == 0 && len(c.AllowedEmails) == 0 {
-		// Refuse to enable SSO without an allow-list; otherwise any valid IdP
-		// login would be promoted to panel admin.
 		return nil
 	}
 	if c.UsernameClaim == "" {
@@ -316,31 +285,41 @@ func (a *OIDCController) callback(c *gin.Context) {
 		}
 	}
 
-	emailClaim, _ := claims["email"].(string)
+	_, _ = claims["email"].(string) // present for logs only — no policy use
 	emailVerified, _ := toBool(claims["email_verified"])
 
-	// Gate allow-lists. At least one is guaranteed non-empty by LoadOIDCConfig.
-	// AllowedSubjects and AllowedEmails are AND-ed when both are set. Subjects
-	// are opaque case-sensitive (RFC 7519); emails normalized lowercase.
-	if len(a.cfg.AllowedSubjects) > 0 {
-		if _, ok := a.cfg.AllowedSubjects[subject]; !ok {
-			a.fail(c, http.StatusForbidden, "SSO identity is not permitted", nil)
-			return
-		}
-	}
-	if len(a.cfg.AllowedEmails) > 0 {
-		if emailClaim == "" {
-			a.fail(c, http.StatusForbidden, "SSO email claim missing; cannot apply allow-list", nil)
-			return
-		}
-		if a.cfg.RequireEmailVerified && !emailVerified {
+	// email_verified: honored only when the id_token actually carries an email
+	// claim; otherwise nothing to gate against.
+	if a.cfg.RequireEmailVerified {
+		if _, ok := claims["email"].(string); ok && !emailVerified {
 			a.fail(c, http.StatusForbidden, "SSO email is not verified by the provider", nil)
 			return
 		}
-		if _, ok := a.cfg.AllowedEmails[strings.ToLower(emailClaim)]; !ok {
-			a.fail(c, http.StatusForbidden, "SSO email is not permitted", nil)
+	}
+
+	// Trust-on-first-use binding. The first SSO identity to clear every check
+	// has its `sub` recorded in the panel DB. Every subsequent login must
+	// present the same `sub`. Operator can clear the binding via the
+	// `x-ui setting -resetSsoBinding` CLI to re-bind (e.g. when switching IdP
+	// accounts or if the IdP itself reassigns the subject).
+	boundSubject, err := a.settingService.GetOIDCBoundSubject()
+	if err != nil {
+		a.fail(c, http.StatusInternalServerError, "SSO: unable to read binding state", err)
+		return
+	}
+	if boundSubject == "" {
+		// First SSO login ever. Record this sub and continue. The write
+		// happens BEFORE session is attached, so a crash between the two
+		// cannot leave a logged-in session without a durable binding.
+		if err := a.settingService.SetOIDCBoundSubject(subject); err != nil {
+			a.fail(c, http.StatusInternalServerError, "SSO: unable to persist binding", err)
 			return
 		}
+		logger.Infof("OIDC: first-login binding locked sub=%s", subject)
+	} else if boundSubject != subject {
+		logger.Warningf("OIDC: sub mismatch, expected=%s got=%s ip=%s", boundSubject, subject, getRemoteIp(c))
+		a.fail(c, http.StatusForbidden, "SSO identity does not match the bound admin", nil)
+		return
 	}
 
 	// 2FA block: if TOTP is enabled on the panel, SSO cannot prove the admin

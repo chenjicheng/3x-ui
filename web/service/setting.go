@@ -105,6 +105,10 @@ var defaultValueMap = map[string]string{
 	"ldapDefaultTotalGB":    "0",
 	"ldapDefaultExpiryDays": "0",
 	"ldapDefaultLimitIP":    "0",
+
+	// OIDC: bound subject is set on first successful SSO login and then locked.
+	// Empty string means "not yet bound" — next login binds.
+	"oidcBoundSubject": "",
 }
 
 // SettingService provides business logic for application settings management.
@@ -701,6 +705,20 @@ func (s *SettingService) GetLdapDefaultExpiryDays() (int, error) {
 
 func (s *SettingService) GetLdapDefaultLimitIP() (int, error) {
 	return s.getInt("ldapDefaultLimitIP")
+}
+
+// GetOIDCBoundSubject returns the OIDC `sub` claim that has been trusted as
+// the panel admin's stable SSO identity, or empty string if nothing is bound
+// yet (in which case the next successful SSO login will bind itself).
+func (s *SettingService) GetOIDCBoundSubject() (string, error) {
+	return s.getString("oidcBoundSubject")
+}
+
+// SetOIDCBoundSubject stores the OIDC subject that is allowed to SSO into the
+// panel. Pass an empty string to clear the binding (lets the next SSO login
+// re-bind to whoever succeeds first).
+func (s *SettingService) SetOIDCBoundSubject(subject string) error {
+	return s.setString("oidcBoundSubject", subject)
 }
 
 func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {

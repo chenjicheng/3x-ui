@@ -944,19 +944,6 @@ configure_sso() {
         return 1
     fi
 
-    # Allow-list: at least one of subject or email must be provided. 3x-ui is
-    # a single-admin panel, and any successful SSO authentication grants an
-    # admin session — so exactly "who is allowed to SSO" is the whole policy.
-    local allowed_email=""
-    while [[ -z "$allowed_email" ]]; do
-        _read_or_exit allowed_email "Email of the user allowed to SSO in (matches IdP 'email' claim): " || return 1
-        allowed_email="${allowed_email// /}"
-        if ! [[ "$allowed_email" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$ ]]; then
-            echo -e "${red}Not a plausible email: '${allowed_email}'. Try again.${plain}"
-            allowed_email=""
-        fi
-    done
-
     # Pass the API key via curl --config so it doesn't appear in /proc/*/cmdline.
     # Escape backslashes and double quotes in the key per curl's -K double-quoted
     # value grammar.
@@ -1076,9 +1063,6 @@ configure_sso() {
         printf 'XUI_OIDC_CLIENT_SECRET=%s\n'          "$(_systemd_env_escape "$secret")"
         printf 'XUI_OIDC_REDIRECT_URL=%s\n'           "$(_systemd_env_escape "$callback")"
         printf 'XUI_OIDC_USERNAME_CLAIM=%s\n'         "$(_systemd_env_escape "$username_claim")"
-        # Allow-list: any IdP identity passing SSO becomes the panel admin, so
-        # this list IS the access policy. Add subjects / emails comma-separated.
-        printf 'XUI_OIDC_ALLOWED_EMAILS=%s\n'         "$(_systemd_env_escape "$allowed_email")"
         printf 'XUI_OIDC_REQUIRE_EMAIL_VERIFIED=%s\n' "$(_systemd_env_escape "true")"
     } > "$env_tmp"
     mv -f "$env_tmp" "$env_file"
@@ -1115,15 +1099,15 @@ configure_sso() {
     echo -e "${green}═══════════════════════════════════════════${plain}"
     echo -e "${green}     SSO (Pocket-ID) Configured!           ${plain}"
     echo -e "${green}═══════════════════════════════════════════${plain}"
-    echo -e "${green}Client ID:      ${client_id}${plain}"
-    echo -e "${green}Callback:       ${callback}${plain}"
-    echo -e "${green}Allowed email:  ${allowed_email}${plain}"
-    echo -e "${green}Env file:       ${env_file}${plain}"
-    echo -e "${yellow}SSO logs you in as the panel admin whose username/password was${plain}"
-    echo -e "${yellow}generated above. The SSO identity and that account are not linked —${plain}"
-    echo -e "${yellow}SSO just unlocks the admin session on successful IdP auth.${plain}"
-    echo -e "${yellow}To allow more people, add to XUI_OIDC_ALLOWED_EMAILS (comma-separated)${plain}"
-    echo -e "${yellow}in ${env_file} and \"systemctl restart x-ui\".${plain}"
+    echo -e "${green}Client ID:   ${client_id}${plain}"
+    echo -e "${green}Callback:    ${callback}${plain}"
+    echo -e "${green}Env file:    ${env_file}${plain}"
+    echo -e "${yellow}Policy: trust-on-first-use. The FIRST successful SSO login is recorded${plain}"
+    echo -e "${yellow}as the panel admin's stable SSO identity; every later login must match${plain}"
+    echo -e "${yellow}that IdP \"sub\". You should be the one who clicks 'Sign in with SSO'${plain}"
+    echo -e "${yellow}first. Safer still: in Pocket-ID, restrict this OIDC Client to your own${plain}"
+    echo -e "${yellow}User Group so nobody else can reach the callback at all.${plain}"
+    echo -e "${yellow}To rebind later:  x-ui setting -resetSsoBinding${plain}"
     echo -e "${yellow}Disable panel 2FA before using SSO — SSO is blocked while TOTP 2FA is${plain}"
     echo -e "${yellow}active to prevent bypassing it.${plain}"
     echo -e "${green}═══════════════════════════════════════════${plain}"

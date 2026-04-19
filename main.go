@@ -255,7 +255,7 @@ func updateTgbotSetting(tgBotToken string, tgBotChatid string, tgBotRuntime stri
 }
 
 // updateSetting updates various panel settings including port, credentials, base path, listen IP, and two-factor authentication.
-func updateSetting(port int, username string, password string, webBasePath string, listenIP string, resetTwoFactor bool) {
+func updateSetting(port int, username string, password string, webBasePath string, listenIP string, resetTwoFactor bool, resetSsoBinding bool) {
 	err := database.InitDB(config.GetDBPath())
 	if err != nil {
 		fmt.Println("Database initialization failed:", err)
@@ -309,6 +309,14 @@ func updateSetting(port int, username string, password string, webBasePath strin
 			fmt.Println("Failed to set listen IP:", err)
 		} else {
 			fmt.Printf("listen %v set successfully", listenIP)
+		}
+	}
+
+	if resetSsoBinding {
+		if err := settingService.SetOIDCBoundSubject(""); err != nil {
+			fmt.Println("Failed to reset SSO binding:", err)
+		} else {
+			fmt.Println("SSO binding cleared — the next successful SSO login will re-bind")
 		}
 	}
 }
@@ -431,6 +439,7 @@ func main() {
 	var show bool
 	var getCert bool
 	var resetTwoFactor bool
+	var resetSsoBinding bool
 	settingCmd.BoolVar(&reset, "reset", false, "Reset all settings")
 	settingCmd.BoolVar(&show, "show", false, "Display current settings")
 	settingCmd.IntVar(&port, "port", 0, "Set panel port number")
@@ -439,6 +448,7 @@ func main() {
 	settingCmd.StringVar(&webBasePath, "webBasePath", "", "Set base path for Panel")
 	settingCmd.StringVar(&listenIP, "listenIP", "", "set panel listenIP IP")
 	settingCmd.BoolVar(&resetTwoFactor, "resetTwoFactor", false, "Reset two-factor authentication settings")
+	settingCmd.BoolVar(&resetSsoBinding, "resetSsoBinding", false, "Clear the OIDC bound subject so the next SSO login rebinds")
 	settingCmd.BoolVar(&getListen, "getListen", false, "Display current panel listenIP IP")
 	settingCmd.BoolVar(&getCert, "getCert", false, "Display current certificate settings")
 	settingCmd.StringVar(&webCertFile, "webCert", "", "Set path to public key file for panel")
@@ -483,7 +493,7 @@ func main() {
 		if reset {
 			resetSetting()
 		} else {
-			updateSetting(port, username, password, webBasePath, listenIP, resetTwoFactor)
+			updateSetting(port, username, password, webBasePath, listenIP, resetTwoFactor, resetSsoBinding)
 		}
 		if show {
 			showSetting(show)
