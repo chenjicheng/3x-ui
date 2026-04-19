@@ -33,7 +33,7 @@ Los administradores pueden añadir archivos `.dat` de GeoSite y GeoIP desde URLs
 ## Inicio Rápido
 
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/chenjicheng/3x-ui/main/install.sh)
 ```
 
 Para documentación completa, visita la [Wiki del proyecto](https://github.com/MHSanaei/3x-ui/wiki).

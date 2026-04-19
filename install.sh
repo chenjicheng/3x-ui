@@ -8,7 +8,24 @@ plain='\033[0m'
 
 cur_dir=$(pwd)
 
-xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+# On Arch-family systems the shipped service unit (x-ui.service.arch) hard-codes
+# /usr/lib/x-ui as ExecStart/WorkingDirectory. Match that here so everything
+# downstream (configure_sso, manual 'x-ui' calls) addresses the real binary.
+_os_release=""
+if [[ -f /etc/os-release ]]; then
+    _os_release=$(. /etc/os-release; echo "${ID:-}")
+elif [[ -f /usr/lib/os-release ]]; then
+    _os_release=$(. /usr/lib/os-release; echo "${ID:-}")
+fi
+case "${_os_release}" in
+    arch | manjaro | parch)
+        xui_folder="${XUI_MAIN_FOLDER:=/usr/lib/x-ui}"
+        ;;
+    *)
+        xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+        ;;
+esac
+unset _os_release
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 
 # check root
@@ -885,7 +902,13 @@ configure_sso() {
 
     local url_port=":${current_port}"
     [[ "$current_port" == "443" ]] && url_port=""
-    local callback="https://${host}${url_port}${current_path}oidc/callback"
+    # Wrap raw IPv6 addresses in brackets per RFC 3986, otherwise the colons
+    # in the address collide with the port separator and the URL is invalid.
+    local host_for_url="$host"
+    if is_ipv6 "$host" && [[ "$host" != \[*\] ]]; then
+        host_for_url="[${host}]"
+    fi
+    local callback="https://${host_for_url}${url_port}${current_path}oidc/callback"
 
     # Deterministic client id: replace every non-alphanumeric/non-dash char with
     # '-' and lowercase. Strips IPv6 brackets, dots, colons, anything weird.
@@ -909,24 +932,34 @@ configure_sso() {
         _read_or_exit api_key "Pocket-ID STATIC_API_KEY: " silent || return 1
     done
 
-    # Pass the API key via a curl --config file on stdin so it never shows up
-    # in `ps`/procfs. The config is read from stdin ("-") which bash sets up
-    # for us via process substitution.
-    local _cfg_list _cfg_post
-    _cfg_list=$(mktemp)
-    _cfg_post=$(mktemp)
-    chmod 600 "$_cfg_list" "$_cfg_post"
-    # shellcheck disable=SC2064
-    trap "rm -f '$_cfg_list' '$_cfg_post'" RETURN
+    # Pass the API key via curl --config so it doesn't appear in /proc/*/cmdline.
+    # Escape backslashes and double quotes in the key per curl's -K double-quoted
+    # value grammar.
+    local api_key_esc="${api_key//\\/\\\\}"
+    api_key_esc="${api_key_esc//\"/\\\"}"
 
-    printf 'header = "X-API-Key: %s"\n' "$api_key" > "$_cfg_list"
-    printf 'header = "X-API-Key: %s"\nheader = "Content-Type: application/json"\nrequest = "POST"\n' "$api_key" > "$_cfg_post"
+    # Use a dedicated tempdir. The global SSO_TMPDIR is cleaned by the script's
+    # top-level EXIT/INT/TERM trap (see bottom of file), so tempfiles holding the
+    # API key and client secret are wiped on Ctrl-C, kill, or `exit` too — not
+    # only on normal function return.
+    SSO_TMPDIR=$(mktemp -d) || return 1
+    chmod 700 "$SSO_TMPDIR"
+
+    local _cfg_list="$SSO_TMPDIR/cfg_list"
+    local _cfg_post="$SSO_TMPDIR/cfg_post"
+    local list_out="$SSO_TMPDIR/list_out"
+    local create_out="$SSO_TMPDIR/create_out"
+
+    # RETURN trap handles normal function exit; signal traps defined at file
+    # bottom catch the abnormal paths.
+    # shellcheck disable=SC2064
+    trap "rm -rf '$SSO_TMPDIR' 2>/dev/null; SSO_TMPDIR=''" RETURN
+
+    ( umask 077; printf 'header = "X-API-Key: %s"\n' "$api_key_esc" > "$_cfg_list" )
+    ( umask 077; printf 'header = "X-API-Key: %s"\nheader = "Content-Type: application/json"\nrequest = "POST"\n' "$api_key_esc" > "$_cfg_post" )
 
     # GET current clients — capture HTTP status separately so we distinguish
     # transport errors, auth errors, and 200 OK.
-    local list_out=$(mktemp)
-    # shellcheck disable=SC2064
-    trap "rm -f '$_cfg_list' '$_cfg_post' '$list_out'" RETURN
     local list_code
     list_code=$(curl -sS -o "$list_out" -w '%{http_code}' -K "$_cfg_list" "${issuer}/api/oidc/clients" || echo "000")
     if [[ "$list_code" != "200" ]]; then
@@ -961,10 +994,7 @@ configure_sso() {
     create_body=$(printf '{"id":%s,"name":%s,"callbackURLs":[%s],"isPublic":false,"pkceEnabled":true}' \
         "$esc_id" "$esc_name" "$esc_cb")
 
-    # POST to create the client.
-    local create_out=$(mktemp)
-    # shellcheck disable=SC2064
-    trap "rm -f '$_cfg_list' '$_cfg_post' '$list_out' '$create_out'" RETURN
+    # POST to create the client. create_out was already allocated + trapped above.
     local create_code
     create_code=$(curl -sS -o "$create_out" -w '%{http_code}' -K "$_cfg_post" \
         --data-binary "${create_body}" "${issuer}/api/oidc/clients" || echo "000")
@@ -1021,9 +1051,10 @@ configure_sso() {
         printf 'XUI_OIDC_CLIENT_SECRET=%s\n'  "$(_systemd_env_escape "$secret")"
         printf 'XUI_OIDC_REDIRECT_URL=%s\n'   "$(_systemd_env_escape "$callback")"
         printf 'XUI_OIDC_USERNAME_CLAIM=%s\n' "$(_systemd_env_escape "email")"
-        printf 'XUI_OIDC_AUTO_CREATE=%s\n'    "$(_systemd_env_escape "false")"
-        printf 'XUI_OIDC_ALLOW_USERNAME_BACKFILL=%s\n' "$(_systemd_env_escape "true")"
-        printf 'XUI_OIDC_REQUIRE_EMAIL_VERIFIED=%s\n'  "$(_systemd_env_escape "true")"
+        # Keep both behaviors OFF by default. See docs for why.
+        printf 'XUI_OIDC_AUTO_CREATE=%s\n'              "$(_systemd_env_escape "false")"
+        printf 'XUI_OIDC_ALLOW_USERNAME_BACKFILL=%s\n'  "$(_systemd_env_escape "false")"
+        printf 'XUI_OIDC_REQUIRE_EMAIL_VERIFIED=%s\n'   "$(_systemd_env_escape "true")"
     } > "$env_tmp"
     mv -f "$env_tmp" "$env_file"
     chmod 600 "$env_file"
@@ -1261,6 +1292,17 @@ install_x-ui() {
 │  ${blue}x-ui uninstall${plain}    - Uninstall                        │
 └───────────────────────────────────────────────────────┘"
 }
+
+# Clean up SSO tempdir on any abnormal exit so the API key / client secret
+# don't survive on disk after Ctrl-C or a signal. Normal function return is
+# handled by the RETURN trap inside configure_sso.
+SSO_TMPDIR=""
+_global_cleanup() {
+    if [[ -n "$SSO_TMPDIR" && -d "$SSO_TMPDIR" ]]; then
+        rm -rf "$SSO_TMPDIR" 2>/dev/null
+    fi
+}
+trap _global_cleanup EXIT INT TERM
 
 echo -e "${green}Running...${plain}"
 install_base

@@ -51,14 +51,20 @@ func boolEnv(name string, defaultVal bool) bool {
 	return strings.EqualFold(v, "true") || v == "1" || strings.EqualFold(v, "yes")
 }
 
-func setEnv(name string) map[string]struct{} {
+// setEnv parses a comma-separated env var into a lookup set. lowercase=true
+// for case-insensitive matches (e.g. emails); false for OIDC subjects, which
+// RFC 7519 defines as opaque case-sensitive strings.
+func setEnv(name string, lowercase bool) map[string]struct{} {
 	raw := strings.TrimSpace(os.Getenv(name))
 	if raw == "" {
 		return nil
 	}
 	out := make(map[string]struct{})
 	for _, p := range strings.Split(raw, ",") {
-		p = strings.ToLower(strings.TrimSpace(p))
+		p = strings.TrimSpace(p)
+		if lowercase {
+			p = strings.ToLower(p)
+		}
 		if p != "" {
 			out[p] = struct{}{}
 		}
@@ -78,8 +84,8 @@ func LoadOIDCConfig() *OIDCConfig {
 		RequireEmailVerified:  boolEnv("XUI_OIDC_REQUIRE_EMAIL_VERIFIED", true),
 		AllowUsernameBackfill: boolEnv("XUI_OIDC_ALLOW_USERNAME_BACKFILL", false),
 		AutoCreate:            boolEnv("XUI_OIDC_AUTO_CREATE", false),
-		AllowedSubjects:       setEnv("XUI_OIDC_ALLOWED_SUBJECTS"),
-		AllowedEmails:         setEnv("XUI_OIDC_ALLOWED_EMAILS"),
+		AllowedSubjects:       setEnv("XUI_OIDC_ALLOWED_SUBJECTS", false),
+		AllowedEmails:         setEnv("XUI_OIDC_ALLOWED_EMAILS", true),
 	}
 	if c.Issuer == "" || c.ClientID == "" || c.ClientSecret == "" || c.RedirectURL == "" {
 		return nil
@@ -264,33 +270,58 @@ func (a *OIDCController) callback(c *gin.Context) {
 		fallbackUsername = s
 	}
 
-	// email_verified: when the configured username claim is derived from an email,
-	// refuse unverified emails. Default on.
-	if a.cfg.RequireEmailVerified && claimsIndicateEmail(a.cfg.UsernameClaim) {
-		verified, _ := claims["email_verified"].(bool)
-		if !verified {
-			a.fail(c, http.StatusForbidden, "SSO email is not verified by the provider", nil)
-			return
-		}
+	emailClaim, _ := claims["email"].(string)
+	emailVerified, _ := toBool(claims["email_verified"])
+
+	// Policy for matching the username claim value against an email-like
+	// invariant. If the configured claim NAME looks email-shaped, or if the
+	// value itself contains '@' (treated as an email for trust purposes), the
+	// IdP's `email_verified` claim must be true.
+	claimIsEmail := claimsIndicateEmail(a.cfg.UsernameClaim) || strings.Contains(fallbackUsername, "@")
+	if a.cfg.RequireEmailVerified && claimIsEmail && !emailVerified {
+		a.fail(c, http.StatusForbidden, "SSO email is not verified by the provider", nil)
+		return
 	}
 
-	// Allow-list check: when configured, the subject OR the email (whichever is
-	// configured) must match one of the allowed values. Prevents open IdPs from
-	// auto-provisioning random users.
+	// Allow-list semantics (explicit so operators aren't surprised):
+	//   - Both empty: no allow-listing; policy falls back to subject/backfill.
+	//   - Only AllowedSubjects set: subject must be listed.
+	//   - Only AllowedEmails set: email claim must be listed; require email_verified.
+	//   - Both set: AND — both must match.
+	// Subjects are opaque and case-sensitive (RFC 7519); emails are normalized
+	// to lowercase.
 	if len(a.cfg.AllowedSubjects) > 0 {
-		if _, ok := a.cfg.AllowedSubjects[strings.ToLower(subject)]; !ok {
+		if _, ok := a.cfg.AllowedSubjects[subject]; !ok {
 			a.fail(c, http.StatusForbidden, "SSO identity is not permitted", nil)
 			return
 		}
 	}
 	if len(a.cfg.AllowedEmails) > 0 {
-		emailClaim, _ := claims["email"].(string)
 		if emailClaim == "" {
-			a.fail(c, http.StatusForbidden, "SSO email is not permitted", nil)
+			a.fail(c, http.StatusForbidden, "SSO email claim missing; cannot apply allow-list", nil)
+			return
+		}
+		if a.cfg.RequireEmailVerified && !emailVerified {
+			a.fail(c, http.StatusForbidden, "SSO email is not verified by the provider", nil)
 			return
 		}
 		if _, ok := a.cfg.AllowedEmails[strings.ToLower(emailClaim)]; !ok {
 			a.fail(c, http.StatusForbidden, "SSO email is not permitted", nil)
+			return
+		}
+	}
+
+	// If the claim used for binding is NOT email-shaped (e.g. preferred_username)
+	// AND either of the "bootstrap" policies is on (backfill, auto-create), the
+	// operator MUST provide an allow-list. Otherwise an IdP that lets users
+	// self-pick their preferred_username (Keycloak default, many others) is a
+	// takeover vector — matching any existing panel username or provisioning an
+	// admin.
+	if (a.cfg.AllowUsernameBackfill || a.cfg.AutoCreate) && !claimIsEmail {
+		if len(a.cfg.AllowedSubjects) == 0 && len(a.cfg.AllowedEmails) == 0 {
+			a.fail(c, http.StatusForbidden,
+				"SSO bootstrap (backfill/auto-create) on a non-email claim requires XUI_OIDC_ALLOWED_SUBJECTS or XUI_OIDC_ALLOWED_EMAILS",
+				nil)
 			return
 		}
 	}
@@ -405,4 +436,23 @@ func clearTempCookie(c *gin.Context, name string, secure bool) {
 func claimsIndicateEmail(claim string) bool {
 	c := strings.ToLower(claim)
 	return c == "email" || strings.HasSuffix(c, "_email") || c == "mail"
+}
+
+// toBool accepts boolean claims in both real-bool form and the string form
+// ("true"/"false") that some IdPs (notably older Okta) emit. Returns (ok=true,
+// v=parsed) on success, (false, false) if the shape wasn't a recognizable bool.
+func toBool(v any) (bool, bool) {
+	switch x := v.(type) {
+	case bool:
+		return x, true
+	case string:
+		s := strings.ToLower(strings.TrimSpace(x))
+		if s == "true" {
+			return true, true
+		}
+		if s == "false" {
+			return false, true
+		}
+	}
+	return false, false
 }

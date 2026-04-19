@@ -2,23 +2,17 @@ name: Release 3X-UI
 
 on:
   workflow_dispatch:
+  # No `paths:` filter here. GitHub applies `paths:` to tag pushes as well, so
+  # tag pushes whose tagged commit didn't touch those paths would be silently
+  # skipped — making `git push --tags v*-sso.*` a no-op when the tagged commit
+  # was a docs-only fix. `paths-ignore` doesn't help either. Accept slightly
+  # redundant CI runs for doc-only commits.
   push:
     branches:
       - '**'
     tags:
       - "v*.*.*"
       - "v*-sso.*"
-    paths:
-      - '**.js'
-      - '**.css'
-      - '**.html'
-      - '**.sh'
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'x-ui.service.debian'
-      - 'x-ui.service.arch'
-      - 'x-ui.service.rhel'
   pull_request:
 
 jobs:

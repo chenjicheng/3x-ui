@@ -33,7 +33,7 @@ Administrators can add custom GeoSite and GeoIP `.dat` files from URLs in the pa
 ## Quick Start
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/chenjicheng/3x-ui/main/install.sh)
 ```
 
 For full documentation, please visit the [project Wiki](https://github.com/MHSanaei/3x-ui/wiki).
