@@ -29,6 +29,15 @@ const (
 )
 
 // OIDCConfig is the runtime OIDC configuration assembled from env vars.
+//
+// 3x-ui is a single-admin panel: there is one local admin row, period. SSO
+// does not create, link, or back-fill users — a successful SSO authentication
+// simply grants a session that acts AS that single admin. The admin's
+// username/password stays as an emergency fallback.
+//
+// Security therefore rests entirely on "who is allowed to complete SSO?". At
+// least one of AllowedSubjects / AllowedEmails must be non-empty; otherwise
+// LoadOIDCConfig returns nil and SSO is disabled at startup.
 type OIDCConfig struct {
 	Issuer        string
 	ClientID      string
@@ -36,11 +45,9 @@ type OIDCConfig struct {
 	RedirectURL   string
 	UsernameClaim string
 
-	RequireEmailVerified  bool
-	AllowUsernameBackfill bool
-	AutoCreate            bool
-	AllowedSubjects       map[string]struct{}
-	AllowedEmails         map[string]struct{}
+	RequireEmailVerified bool
+	AllowedSubjects      map[string]struct{}
+	AllowedEmails        map[string]struct{}
 }
 
 func boolEnv(name string, defaultVal bool) bool {
@@ -72,22 +79,28 @@ func setEnv(name string, lowercase bool) map[string]struct{} {
 	return out
 }
 
-// LoadOIDCConfig reads XUI_OIDC_* env vars. Returns nil when the four required
-// fields (issuer, client id, secret, redirect) are not all set.
+// LoadOIDCConfig reads XUI_OIDC_* env vars. Returns nil when any required
+// field is missing — required = issuer + client id + secret + redirect URL,
+// PLUS at least one allow-list entry (subjects or emails). Without an
+// allow-list, any IdP user would gain admin access, so we refuse to start
+// SSO in that state.
 func LoadOIDCConfig() *OIDCConfig {
 	c := &OIDCConfig{
-		Issuer:                strings.TrimSpace(os.Getenv("XUI_OIDC_ISSUER")),
-		ClientID:              strings.TrimSpace(os.Getenv("XUI_OIDC_CLIENT_ID")),
-		ClientSecret:          strings.TrimSpace(os.Getenv("XUI_OIDC_CLIENT_SECRET")),
-		RedirectURL:           strings.TrimSpace(os.Getenv("XUI_OIDC_REDIRECT_URL")),
-		UsernameClaim:         strings.TrimSpace(os.Getenv("XUI_OIDC_USERNAME_CLAIM")),
-		RequireEmailVerified:  boolEnv("XUI_OIDC_REQUIRE_EMAIL_VERIFIED", true),
-		AllowUsernameBackfill: boolEnv("XUI_OIDC_ALLOW_USERNAME_BACKFILL", false),
-		AutoCreate:            boolEnv("XUI_OIDC_AUTO_CREATE", false),
-		AllowedSubjects:       setEnv("XUI_OIDC_ALLOWED_SUBJECTS", false),
-		AllowedEmails:         setEnv("XUI_OIDC_ALLOWED_EMAILS", true),
+		Issuer:               strings.TrimSpace(os.Getenv("XUI_OIDC_ISSUER")),
+		ClientID:             strings.TrimSpace(os.Getenv("XUI_OIDC_CLIENT_ID")),
+		ClientSecret:         strings.TrimSpace(os.Getenv("XUI_OIDC_CLIENT_SECRET")),
+		RedirectURL:          strings.TrimSpace(os.Getenv("XUI_OIDC_REDIRECT_URL")),
+		UsernameClaim:        strings.TrimSpace(os.Getenv("XUI_OIDC_USERNAME_CLAIM")),
+		RequireEmailVerified: boolEnv("XUI_OIDC_REQUIRE_EMAIL_VERIFIED", true),
+		AllowedSubjects:      setEnv("XUI_OIDC_ALLOWED_SUBJECTS", false),
+		AllowedEmails:        setEnv("XUI_OIDC_ALLOWED_EMAILS", true),
 	}
 	if c.Issuer == "" || c.ClientID == "" || c.ClientSecret == "" || c.RedirectURL == "" {
+		return nil
+	}
+	if len(c.AllowedSubjects) == 0 && len(c.AllowedEmails) == 0 {
+		// Refuse to enable SSO without an allow-list; otherwise any valid IdP
+		// login would be promoted to panel admin.
 		return nil
 	}
 	if c.UsernameClaim == "" {
@@ -294,43 +307,21 @@ func (a *OIDCController) callback(c *gin.Context) {
 		a.fail(c, http.StatusBadGateway, "SSO id_token sub is too long", nil)
 		return
 	}
-	// Strictly extract the configured username claim.
-	var fallbackUsername string
+	// Extract configured claim for display/logging only. Not used as an auth
+	// decision input — that's the allow-list's job.
+	var displayName string
 	if v, present := claims[a.cfg.UsernameClaim]; present {
-		s, isStr := v.(string)
-		if !isStr || s == "" {
-			a.fail(c, http.StatusBadGateway, "SSO claim is not a non-empty string",
-				errors.New("claim "+a.cfg.UsernameClaim+" had unsupported type or was empty"))
-			return
-		}
-		fallbackUsername = sanitizeUsername(s)
-		if fallbackUsername == "" {
-			a.fail(c, http.StatusBadGateway, "SSO claim contains only disallowed characters", nil)
-			return
+		if s, ok := v.(string); ok && s != "" {
+			displayName = sanitizeUsername(s)
 		}
 	}
 
 	emailClaim, _ := claims["email"].(string)
 	emailVerified, _ := toBool(claims["email_verified"])
 
-	// email_verified in the id_token attests ONLY to the value of the `email`
-	// claim — not to preferred_username or any other claim that happens to
-	// contain an '@'. Enforce verification only when the configured username
-	// claim IS the email claim by name. For other claim shapes the bootstrap
-	// gate below (requires allow-list) is what keeps the flow safe.
-	claimIsEmail := claimsIndicateEmail(a.cfg.UsernameClaim)
-	if a.cfg.RequireEmailVerified && claimIsEmail && !emailVerified {
-		a.fail(c, http.StatusForbidden, "SSO email is not verified by the provider", nil)
-		return
-	}
-
-	// Allow-list semantics (explicit so operators aren't surprised):
-	//   - Both empty: no allow-listing; policy falls back to subject/backfill.
-	//   - Only AllowedSubjects set: subject must be listed.
-	//   - Only AllowedEmails set: email claim must be listed; require email_verified.
-	//   - Both set: AND — both must match.
-	// Subjects are opaque and case-sensitive (RFC 7519); emails are normalized
-	// to lowercase.
+	// Gate allow-lists. At least one is guaranteed non-empty by LoadOIDCConfig.
+	// AllowedSubjects and AllowedEmails are AND-ed when both are set. Subjects
+	// are opaque case-sensitive (RFC 7519); emails normalized lowercase.
 	if len(a.cfg.AllowedSubjects) > 0 {
 		if _, ok := a.cfg.AllowedSubjects[subject]; !ok {
 			a.fail(c, http.StatusForbidden, "SSO identity is not permitted", nil)
@@ -352,42 +343,23 @@ func (a *OIDCController) callback(c *gin.Context) {
 		}
 	}
 
-	// If the claim used for binding is NOT email-shaped (e.g. preferred_username)
-	// AND either of the "bootstrap" policies is on (backfill, auto-create), the
-	// operator MUST provide an allow-list. Otherwise an IdP that lets users
-	// self-pick their preferred_username (Keycloak default, many others) is a
-	// takeover vector — matching any existing panel username or provisioning an
-	// admin.
-	if (a.cfg.AllowUsernameBackfill || a.cfg.AutoCreate) && !claimIsEmail {
-		if len(a.cfg.AllowedSubjects) == 0 && len(a.cfg.AllowedEmails) == 0 {
-			a.fail(c, http.StatusForbidden,
-				"SSO bootstrap (backfill/auto-create) on a non-email claim requires XUI_OIDC_ALLOWED_SUBJECTS or XUI_OIDC_ALLOWED_EMAILS",
-				nil)
-			return
-		}
-	}
-
-	// Check 2FA BEFORE any DB side effect. If 2FA is enabled, SSO alone is not
-	// sufficient (the IdP cannot attest that the admin also holds the panel's
-	// TOTP secret), so we reject to avoid being a backdoor around 2FA. Doing
-	// this before GetOrLinkOIDCUser also prevents leaving orphan user rows
-	// from rejected-but-would-have-auto-created logins.
+	// 2FA block: if TOTP is enabled on the panel, SSO cannot prove the admin
+	// also holds the secret, so we refuse.
 	if twoFactorEnabled, err := a.settingService.GetTwoFactorEnable(); err == nil && twoFactorEnabled {
 		a.fail(c, http.StatusForbidden,
 			"SSO login disabled while panel 2FA is enabled; disable 2FA to use SSO", nil)
 		return
 	}
 
-	policy := service.OIDCLinkPolicy{
-		AllowUsernameBackfill: a.cfg.AllowUsernameBackfill,
-		AutoCreate:            a.cfg.AutoCreate,
-	}
-	user, err := a.userService.GetOrLinkOIDCUser(subject, fallbackUsername, policy)
+	// 3x-ui is a single-admin panel. Load THE admin row; SSO grants a session
+	// that acts AS that admin, without creating or linking any separate user.
+	user, err := a.userService.GetFirstUser()
 	if err != nil {
-		logger.Warningf("OIDC login rejected sub=%q name=%q: %v", subject, fallbackUsername, err)
-		a.tgbot.UserLoginNotify(fallbackUsername, "SSO:unbound", getRemoteIp(c), time.Now().Format("2006-01-02 15:04:05"), 0)
-		a.fail(c, http.StatusForbidden, "SSO identity is not bound to any panel account", nil)
+		a.fail(c, http.StatusInternalServerError, "SSO: unable to load admin account", err)
 		return
+	}
+	if displayName == "" {
+		displayName = user.Username
 	}
 
 	// Rotate the session before attaching the logged-in user to avoid session
@@ -409,8 +381,8 @@ func (a *OIDCController) callback(c *gin.Context) {
 		logger.Warning("OIDC: unable to save session:", err)
 	}
 
-	logger.Infof("OIDC login ok: user=%s sub=%s ip=%s", user.Username, subject, getRemoteIp(c))
-	a.tgbot.UserLoginNotify(user.Username, "SSO", getRemoteIp(c), time.Now().Format("2006-01-02 15:04:05"), 1)
+	logger.Infof("OIDC login ok: admin=%s idp=%s sub=%s ip=%s", user.Username, displayName, subject, getRemoteIp(c))
+	a.tgbot.UserLoginNotify(displayName, "SSO", getRemoteIp(c), time.Now().Format("2006-01-02 15:04:05"), 1)
 
 	c.Redirect(http.StatusFound, c.GetString("base_path")+"panel/")
 }
@@ -464,11 +436,6 @@ func clearTempCookie(c *gin.Context, name string, secure bool) {
 		Secure:   secure,
 		SameSite: http.SameSiteLaxMode,
 	})
-}
-
-func claimsIndicateEmail(claim string) bool {
-	c := strings.ToLower(claim)
-	return c == "email" || strings.HasSuffix(c, "_email") || c == "mail"
 }
 
 // sanitizeUsername strips control characters and caps length so a malicious
