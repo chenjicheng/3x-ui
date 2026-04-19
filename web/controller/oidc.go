@@ -297,10 +297,23 @@ func (a *OIDCController) callback(c *gin.Context) {
 		}
 	}
 
-	// Trust-on-first-use binding, using a compare-and-set on the Setting row
-	// so two concurrent first-login callbacks cannot both walk away believing
-	// they bound. Whoever's UPDATE ... WHERE value='' hits first wins; the
-	// loser reads the winner's sub back and (if it's not theirs) gets rejected.
+	// 2FA block FIRST, before any DB side effect. If TOTP is enabled, SSO
+	// is unconditionally refused — no binding, no session, no state changes.
+	// Order matters: if we bound the subject before this gate, an attacker
+	// who can reach /oidc/callback while 2FA is enabled would permanently
+	// lock the admin's sub to the attacker's identity. When the admin later
+	// disables 2FA to use SSO, their sub wouldn't match the attacker's and
+	// they'd need to run `x-ui setting -resetSsoBinding` to recover.
+	if twoFactorEnabled, err := a.settingService.GetTwoFactorEnable(); err == nil && twoFactorEnabled {
+		a.fail(c, http.StatusForbidden,
+			"SSO login disabled while panel 2FA is enabled; disable 2FA to use SSO", nil)
+		return
+	}
+
+	// Trust-on-first-use binding, serialized by an in-process mutex so two
+	// concurrent first-login callbacks cannot both walk away believing they
+	// bound. The first to finish get/save wins; any later caller whose sub
+	// doesn't match the stored one is rejected.
 	//
 	// The operator can clear the binding via `x-ui setting -resetSsoBinding`
 	// to re-bind (e.g. when switching IdP accounts or if the IdP itself
@@ -313,14 +326,6 @@ func (a *OIDCController) callback(c *gin.Context) {
 	if boundSubject != subject {
 		logger.Warningf("OIDC: sub mismatch, expected=%s got=%s ip=%s", boundSubject, subject, getRemoteIp(c))
 		a.fail(c, http.StatusForbidden, "SSO identity does not match the bound admin", nil)
-		return
-	}
-
-	// 2FA block: if TOTP is enabled on the panel, SSO cannot prove the admin
-	// also holds the secret, so we refuse.
-	if twoFactorEnabled, err := a.settingService.GetTwoFactorEnable(); err == nil && twoFactorEnabled {
-		a.fail(c, http.StatusForbidden,
-			"SSO login disabled while panel 2FA is enabled; disable 2FA to use SSO", nil)
 		return
 	}
 
