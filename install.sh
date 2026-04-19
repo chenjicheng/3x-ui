@@ -856,17 +856,10 @@ configure_sso() {
     echo -e "${green}═══════════════════════════════════════════${plain}"
     echo -e "${green}     SSO Setup (Pocket-ID / OIDC)          ${plain}"
     echo -e "${green}═══════════════════════════════════════════${plain}"
-    echo -e "${yellow}Integrate this panel with a Pocket-ID server so admins can sign in via SSO.${plain}"
     echo -e "${yellow}Needs: Pocket-ID issuer URL and a STATIC_API_KEY value.${plain}"
+    echo -e "${yellow}To skip SSO, press Ctrl-C now (panel stays fully functional with${plain}"
+    echo -e "${yellow}username/password login).${plain}"
     echo ""
-
-    local enable_sso=""
-    _read_or_exit enable_sso "Configure SSO now? (y/N): " || return 0
-    enable_sso="${enable_sso,,}"
-    if [[ "$enable_sso" != "y" && "$enable_sso" != "yes" ]]; then
-        echo -e "${yellow}Skipping SSO setup. Re-run this installer later to add it.${plain}"
-        return 0
-    fi
 
     # Read current panel port and webBasePath from x-ui settings (source of truth).
     # Anchor ^port: to avoid false matches with subPort, tgBotPort, etc.
