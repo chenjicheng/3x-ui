@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v2/database"
@@ -721,33 +722,26 @@ func (s *SettingService) SetOIDCBoundSubject(subject string) error {
 	return s.setString("oidcBoundSubject", subject)
 }
 
-// BindOIDCSubjectIfEmpty atomically claims the SSO binding for the given
-// subject iff nothing is currently bound. Returns the subject that is actually
-// bound afterwards (== our subject if we won, or someone else's if we raced
-// and lost). Uses an `UPDATE ... WHERE value = ”` compare-and-set so two
-// concurrent first-login handlers cannot both walk away believing they bound.
+// oidcBindMu serializes first-login binding attempts within the process.
+// 3x-ui runs as a single Go process, so an in-memory mutex is enough: every
+// concurrent /oidc/callback handler goes through this one lock before it
+// decides whether to bind or reject.
 //
-// The Setting row must already exist (initialized via the default value map
-// on AutoMigrate). If somehow it doesn't, we fall through to the regular set.
+// Why not rely on SQL alone: Setting.Key has no uniqueIndex in the upstream
+// schema and default rows are seeded lazily (not populated at AutoMigrate
+// time). On a first-ever SSO login the row does not exist, so two concurrent
+// callbacks would each see "no row" and each Create fresh rows, both walking
+// away with their own subject bound. This mutex makes the get/save sequence
+// atomic at the service layer regardless of what SQL does underneath.
+var oidcBindMu sync.Mutex
+
 func (s *SettingService) BindOIDCSubjectIfEmpty(subject string) (string, error) {
 	if subject == "" {
 		return "", errors.New("refusing to bind empty subject")
 	}
-	db := database.GetDB()
+	oidcBindMu.Lock()
+	defer oidcBindMu.Unlock()
 
-	// Try the conditional update first.
-	res := db.Model(&model.Setting{}).
-		Where("key = ? AND (value IS NULL OR value = ?)", "oidcBoundSubject", "").
-		Update("value", subject)
-	if res.Error != nil {
-		return "", res.Error
-	}
-	if res.RowsAffected == 1 {
-		return subject, nil
-	}
-
-	// Either the row already has a non-empty value (lost the race / existing
-	// binding) or the row doesn't exist yet. Read current state back.
 	current, err := s.getString("oidcBoundSubject")
 	if err != nil {
 		return "", err
@@ -755,9 +749,6 @@ func (s *SettingService) BindOIDCSubjectIfEmpty(subject string) (string, error) 
 	if current != "" {
 		return current, nil
 	}
-
-	// Row genuinely doesn't exist yet — create it (rare: should be seeded by
-	// defaultValueMap + AutoMigrate, but be robust).
 	if err := s.saveSetting("oidcBoundSubject", subject); err != nil {
 		return "", err
 	}
