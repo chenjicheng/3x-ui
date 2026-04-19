@@ -721,6 +721,49 @@ func (s *SettingService) SetOIDCBoundSubject(subject string) error {
 	return s.setString("oidcBoundSubject", subject)
 }
 
+// BindOIDCSubjectIfEmpty atomically claims the SSO binding for the given
+// subject iff nothing is currently bound. Returns the subject that is actually
+// bound afterwards (== our subject if we won, or someone else's if we raced
+// and lost). Uses an `UPDATE ... WHERE value = ”` compare-and-set so two
+// concurrent first-login handlers cannot both walk away believing they bound.
+//
+// The Setting row must already exist (initialized via the default value map
+// on AutoMigrate). If somehow it doesn't, we fall through to the regular set.
+func (s *SettingService) BindOIDCSubjectIfEmpty(subject string) (string, error) {
+	if subject == "" {
+		return "", errors.New("refusing to bind empty subject")
+	}
+	db := database.GetDB()
+
+	// Try the conditional update first.
+	res := db.Model(&model.Setting{}).
+		Where("key = ? AND (value IS NULL OR value = ?)", "oidcBoundSubject", "").
+		Update("value", subject)
+	if res.Error != nil {
+		return "", res.Error
+	}
+	if res.RowsAffected == 1 {
+		return subject, nil
+	}
+
+	// Either the row already has a non-empty value (lost the race / existing
+	// binding) or the row doesn't exist yet. Read current state back.
+	current, err := s.getString("oidcBoundSubject")
+	if err != nil {
+		return "", err
+	}
+	if current != "" {
+		return current, nil
+	}
+
+	// Row genuinely doesn't exist yet — create it (rare: should be seeded by
+	// defaultValueMap + AutoMigrate, but be robust).
+	if err := s.saveSetting("oidcBoundSubject", subject); err != nil {
+		return "", err
+	}
+	return subject, nil
+}
+
 func (s *SettingService) UpdateAllSetting(allSetting *entity.AllSetting) error {
 	if err := allSetting.CheckValid(); err != nil {
 		return err

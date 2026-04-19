@@ -297,26 +297,20 @@ func (a *OIDCController) callback(c *gin.Context) {
 		}
 	}
 
-	// Trust-on-first-use binding. The first SSO identity to clear every check
-	// has its `sub` recorded in the panel DB. Every subsequent login must
-	// present the same `sub`. Operator can clear the binding via the
-	// `x-ui setting -resetSsoBinding` CLI to re-bind (e.g. when switching IdP
-	// accounts or if the IdP itself reassigns the subject).
-	boundSubject, err := a.settingService.GetOIDCBoundSubject()
+	// Trust-on-first-use binding, using a compare-and-set on the Setting row
+	// so two concurrent first-login callbacks cannot both walk away believing
+	// they bound. Whoever's UPDATE ... WHERE value='' hits first wins; the
+	// loser reads the winner's sub back and (if it's not theirs) gets rejected.
+	//
+	// The operator can clear the binding via `x-ui setting -resetSsoBinding`
+	// to re-bind (e.g. when switching IdP accounts or if the IdP itself
+	// reassigned the subject).
+	boundSubject, err := a.settingService.BindOIDCSubjectIfEmpty(subject)
 	if err != nil {
-		a.fail(c, http.StatusInternalServerError, "SSO: unable to read binding state", err)
+		a.fail(c, http.StatusInternalServerError, "SSO: unable to read or write binding state", err)
 		return
 	}
-	if boundSubject == "" {
-		// First SSO login ever. Record this sub and continue. The write
-		// happens BEFORE session is attached, so a crash between the two
-		// cannot leave a logged-in session without a durable binding.
-		if err := a.settingService.SetOIDCBoundSubject(subject); err != nil {
-			a.fail(c, http.StatusInternalServerError, "SSO: unable to persist binding", err)
-			return
-		}
-		logger.Infof("OIDC: first-login binding locked sub=%s", subject)
-	} else if boundSubject != subject {
+	if boundSubject != subject {
 		logger.Warningf("OIDC: sub mismatch, expected=%s got=%s ip=%s", boundSubject, subject, getRemoteIp(c))
 		a.fail(c, http.StatusForbidden, "SSO identity does not match the bound admin", nil)
 		return
