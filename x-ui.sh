@@ -69,8 +69,16 @@ echo "The OS release is: $release"
 os_version=""
 os_version=$(grep "^VERSION_ID" /etc/os-release | cut -d '=' -f2 | tr -d '"' | tr -d '.')
 
-# Declare Variables
-xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+# Declare Variables — x-ui.service.arch puts the binary at /usr/lib/x-ui, so
+# on Arch-family hosts the menu must address the same path as install.sh.
+case "${release}" in
+    arch | manjaro | parch)
+        xui_folder="${XUI_MAIN_FOLDER:=/usr/lib/x-ui}"
+        ;;
+    *)
+        xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+        ;;
+esac
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 log_folder="${XUI_LOG_FOLDER:=/var/log/x-ui}"
 mkdir -p "${log_folder}"
