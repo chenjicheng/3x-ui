@@ -304,7 +304,16 @@ func (a *OIDCController) callback(c *gin.Context) {
 	// lock the admin's sub to the attacker's identity. When the admin later
 	// disables 2FA to use SSO, their sub wouldn't match the attacker's and
 	// they'd need to run `x-ui setting -resetSsoBinding` to recover.
-	if twoFactorEnabled, err := a.settingService.GetTwoFactorEnable(); err == nil && twoFactorEnabled {
+	//
+	// Fail CLOSED on a DB read error: we cannot confirm 2FA is off, so we
+	// refuse to proceed. Failing open here would let SSO bypass an enabled
+	// 2FA the moment the settings read transiently errors.
+	twoFactorEnabled, err := a.settingService.GetTwoFactorEnable()
+	if err != nil {
+		a.fail(c, http.StatusInternalServerError, "SSO: unable to read 2FA state", err)
+		return
+	}
+	if twoFactorEnabled {
 		a.fail(c, http.StatusForbidden,
 			"SSO login disabled while panel 2FA is enabled; disable 2FA to use SSO", nil)
 		return
