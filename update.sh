@@ -6,7 +6,23 @@ blue='\033[0;34m'
 yellow='\033[0;33m'
 plain='\033[0m'
 
-xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+# Mirror install.sh: x-ui.service.arch ships WorkingDirectory=/usr/lib/x-ui,
+# so on Arch-family systems the binary must actually be there.
+_os_release=""
+if [[ -f /etc/os-release ]]; then
+    _os_release=$(. /etc/os-release; echo "${ID:-}")
+elif [[ -f /usr/lib/os-release ]]; then
+    _os_release=$(. /usr/lib/os-release; echo "${ID:-}")
+fi
+case "${_os_release}" in
+    arch | manjaro | parch)
+        xui_folder="${XUI_MAIN_FOLDER:=/usr/lib/x-ui}"
+        ;;
+    *)
+        xui_folder="${XUI_MAIN_FOLDER:=/usr/local/x-ui}"
+        ;;
+esac
+unset _os_release
 xui_service="${XUI_SERVICE:=/etc/systemd/system}"
 
 # Don't edit this config
