@@ -313,11 +313,12 @@ func (a *OIDCController) callback(c *gin.Context) {
 	emailClaim, _ := claims["email"].(string)
 	emailVerified, _ := toBool(claims["email_verified"])
 
-	// Policy for matching the username claim value against an email-like
-	// invariant. If the configured claim NAME looks email-shaped, or if the
-	// value itself contains '@' (treated as an email for trust purposes), the
-	// IdP's `email_verified` claim must be true.
-	claimIsEmail := claimsIndicateEmail(a.cfg.UsernameClaim) || strings.Contains(fallbackUsername, "@")
+	// email_verified in the id_token attests ONLY to the value of the `email`
+	// claim — not to preferred_username or any other claim that happens to
+	// contain an '@'. Enforce verification only when the configured username
+	// claim IS the email claim by name. For other claim shapes the bootstrap
+	// gate below (requires allow-list) is what keeps the flow safe.
+	claimIsEmail := claimsIndicateEmail(a.cfg.UsernameClaim)
 	if a.cfg.RequireEmailVerified && claimIsEmail && !emailVerified {
 		a.fail(c, http.StatusForbidden, "SSO email is not verified by the provider", nil)
 		return
@@ -366,6 +367,17 @@ func (a *OIDCController) callback(c *gin.Context) {
 		}
 	}
 
+	// Check 2FA BEFORE any DB side effect. If 2FA is enabled, SSO alone is not
+	// sufficient (the IdP cannot attest that the admin also holds the panel's
+	// TOTP secret), so we reject to avoid being a backdoor around 2FA. Doing
+	// this before GetOrLinkOIDCUser also prevents leaving orphan user rows
+	// from rejected-but-would-have-auto-created logins.
+	if twoFactorEnabled, err := a.settingService.GetTwoFactorEnable(); err == nil && twoFactorEnabled {
+		a.fail(c, http.StatusForbidden,
+			"SSO login disabled while panel 2FA is enabled; disable 2FA to use SSO", nil)
+		return
+	}
+
 	policy := service.OIDCLinkPolicy{
 		AllowUsernameBackfill: a.cfg.AllowUsernameBackfill,
 		AutoCreate:            a.cfg.AutoCreate,
@@ -375,16 +387,6 @@ func (a *OIDCController) callback(c *gin.Context) {
 		logger.Warningf("OIDC login rejected sub=%q name=%q: %v", subject, fallbackUsername, err)
 		a.tgbot.UserLoginNotify(fallbackUsername, "SSO:unbound", getRemoteIp(c), time.Now().Format("2006-01-02 15:04:05"), 0)
 		a.fail(c, http.StatusForbidden, "SSO identity is not bound to any panel account", nil)
-		return
-	}
-
-	// If 2FA is enabled on this panel, SSO alone is not sufficient; the IdP
-	// cannot attest that the admin also holds the panel's TOTP secret. Reject
-	// to avoid creating a backdoor around 2FA. Operators who want SSO-without-
-	// 2FA must disable 2FA in panel settings explicitly.
-	if twoFactorEnabled, err := a.settingService.GetTwoFactorEnable(); err == nil && twoFactorEnabled {
-		a.fail(c, http.StatusForbidden,
-			"SSO login disabled while panel 2FA is enabled; disable 2FA to use SSO", nil)
 		return
 	}
 
