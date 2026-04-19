@@ -782,6 +782,51 @@ config_after_install() {
     ${xui_folder}/x-ui migrate
 }
 
+# JSON-escape a string for safe embedding inside double-quoted JSON values.
+# Prefers jq when available; falls back to careful sed escaping of the minimal
+# set of characters required by RFC 8259.
+_json_escape() {
+    local s="$1"
+    if command -v jq >/dev/null 2>&1; then
+        jq -Rn --arg v "$s" '$v'
+        return
+    fi
+    # Escape backslash first, then quote, then control characters.
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '"%s"' "$s"
+}
+
+# systemd EnvironmentFile values with special characters must be double-quoted
+# with backslash escaping. Quote everything we emit so `$`, `#`, spaces and
+# backslashes survive intact.
+_systemd_env_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
+# Single-shot `read` wrapper that aborts (returns non-zero) on EOF so callers
+# don't spin in an infinite prompt loop if stdin is closed.
+_read_or_exit() {
+    local __var="$1"
+    local prompt="$2"
+    local silent="$3"
+    local val
+    if [[ "$silent" == "silent" ]]; then
+        read -rsp "$prompt" val || return 1
+        echo
+    else
+        read -rp "$prompt" val || return 1
+    fi
+    printf -v "$__var" '%s' "$val"
+    return 0
+}
+
 configure_sso() {
     local xui_bin="${xui_folder}/x-ui"
 
@@ -799,7 +844,7 @@ configure_sso() {
     echo ""
 
     local enable_sso=""
-    read -rp "Configure SSO now? (y/N): " enable_sso
+    _read_or_exit enable_sso "Configure SSO now? (y/N): " || return 0
     enable_sso="${enable_sso,,}"
     if [[ "$enable_sso" != "y" && "$enable_sso" != "yes" ]]; then
         echo -e "${yellow}Skipping SSO setup. Re-run this installer later to add it.${plain}"
@@ -807,13 +852,14 @@ configure_sso() {
     fi
 
     # Read current panel port and webBasePath from x-ui settings (source of truth).
+    # Anchor ^port: to avoid false matches with subPort, tgBotPort, etc.
     local settings current_port current_path
     settings=$("${xui_bin}" setting -show true 2>/dev/null)
-    current_port=$(echo "$settings" | grep 'port:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
-    current_path=$(echo "$settings" | grep 'webBasePath:' | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    current_port=$(echo "$settings" | grep -E '^port:' | head -n1 | awk -F': ' '{print $2}' | tr -d '[:space:]')
+    current_path=$(echo "$settings" | grep -E '^webBasePath:' | head -n1 | awk -F': ' '{print $2}' | tr -d '[:space:]')
 
-    if [[ -z "$current_port" ]]; then
-        echo -e "${red}Unable to read panel port from x-ui settings; skipping SSO setup.${plain}"
+    if ! [[ "$current_port" =~ ^[0-9]+$ ]] || ((current_port < 1 || current_port > 65535)); then
+        echo -e "${red}Unable to parse a valid panel port (${current_port:-empty}); skipping SSO setup.${plain}"
         return 1
     fi
 
@@ -822,92 +868,186 @@ configure_sso() {
     [[ -n "$current_path" && "${current_path: -1}" != "/" ]] && current_path="${current_path}/"
     current_path="/${current_path}"
 
-    # Determine public host. SSL_HOST is set earlier by the SSL setup flow.
+    # Validate host regardless of whether SSL_HOST is preset so a stale value
+    # from a previous run can't get baked into the OIDC callback URL.
     local host="${SSL_HOST}"
-    while [[ -z "$host" ]] || ! { is_domain "$host" || is_ip "$host"; }; do
-        read -rp "Panel public hostname (domain or IP used for SSO callback): " host
+    if [[ -n "$host" ]] && ! { is_domain "$host" || is_ip "$host"; }; then
+        host=""
+    fi
+    while [[ -z "$host" ]]; do
+        _read_or_exit host "Panel public hostname (domain or IP used for SSO callback): " || return 1
         host="${host// /}"
+        if ! { is_domain "$host" || is_ip "$host"; }; then
+            echo -e "${red}Not a valid domain or IP: '${host}'. Try again.${plain}"
+            host=""
+        fi
     done
 
     local url_port=":${current_port}"
     [[ "$current_port" == "443" ]] && url_port=""
     local callback="https://${host}${url_port}${current_path}oidc/callback"
 
-    # Build a deterministic client id from host (dots/colons -> dashes, lowercased).
+    # Deterministic client id: replace every non-alphanumeric/non-dash char with
+    # '-' and lowercase. Strips IPv6 brackets, dots, colons, anything weird.
     local host_id
-    host_id=$(echo "$host" | tr '.:' '--' | tr '[:upper:]' '[:lower:]')
+    host_id=$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed -E 's/-+/-/g; s/^-//; s/-$//')
     local client_id="3x-ui-${host_id}"
 
     local issuer=""
     while [[ -z "$issuer" ]]; do
-        read -rp "Pocket-ID issuer URL (e.g. https://sso.example.com): " issuer
-        issuer="${issuer%/}"
+        _read_or_exit issuer "Pocket-ID issuer URL (e.g. https://sso.example.com): " || return 1
         issuer="${issuer// /}"
+        issuer="${issuer%/}"
+        if ! [[ "$issuer" =~ ^https?:// ]]; then
+            echo -e "${red}Issuer must start with https:// or http://. Try again.${plain}"
+            issuer=""
+        fi
     done
 
     local api_key=""
     while [[ -z "$api_key" ]]; do
-        read -rsp "Pocket-ID STATIC_API_KEY: " api_key
-        echo
+        _read_or_exit api_key "Pocket-ID STATIC_API_KEY: " silent || return 1
     done
 
-    # Idempotency: if a client with this id already exists, ask user to delete it first.
-    local list_resp
-    list_resp=$(curl -fsSL -H "X-API-Key: ${api_key}" "${issuer}/api/oidc/clients" 2>&1)
-    if [[ -z "$list_resp" ]]; then
-        echo -e "${red}No response from Pocket-ID at ${issuer}. Check URL and network connectivity.${plain}"
+    # Pass the API key via a curl --config file on stdin so it never shows up
+    # in `ps`/procfs. The config is read from stdin ("-") which bash sets up
+    # for us via process substitution.
+    local _cfg_list _cfg_post
+    _cfg_list=$(mktemp)
+    _cfg_post=$(mktemp)
+    chmod 600 "$_cfg_list" "$_cfg_post"
+    # shellcheck disable=SC2064
+    trap "rm -f '$_cfg_list' '$_cfg_post'" RETURN
+
+    printf 'header = "X-API-Key: %s"\n' "$api_key" > "$_cfg_list"
+    printf 'header = "X-API-Key: %s"\nheader = "Content-Type: application/json"\nrequest = "POST"\n' "$api_key" > "$_cfg_post"
+
+    # GET current clients — capture HTTP status separately so we distinguish
+    # transport errors, auth errors, and 200 OK.
+    local list_out=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '$_cfg_list' '$_cfg_post' '$list_out'" RETURN
+    local list_code
+    list_code=$(curl -sS -o "$list_out" -w '%{http_code}' -K "$_cfg_list" "${issuer}/api/oidc/clients" || echo "000")
+    if [[ "$list_code" != "200" ]]; then
+        echo -e "${red}Pocket-ID list clients failed (HTTP ${list_code}). Check issuer URL and API key.${plain}"
         return 1
     fi
-    if echo "$list_resp" | grep -q "\"id\":\"${client_id}\""; then
+
+    # Exact id match via python/jq if available, else conservative grep on both
+    # spaced and unspaced JSON forms.
+    local client_exists=""
+    if command -v jq >/dev/null 2>&1; then
+        if jq -e --arg id "$client_id" 'any(.[]?; .id == $id)' "$list_out" >/dev/null 2>&1; then
+            client_exists=1
+        fi
+    else
+        if grep -Eq "\"id\"[[:space:]]*:[[:space:]]*\"${client_id//\"/\\\"}\"" "$list_out"; then
+            client_exists=1
+        fi
+    fi
+    if [[ -n "$client_exists" ]]; then
         echo -e "${yellow}OIDC client '${client_id}' already exists in Pocket-ID.${plain}"
-        echo -e "${yellow}Delete it there first if you want to regenerate the client secret.${plain}"
+        echo -e "${yellow}The client_secret is shown only once at creation and cannot be retrieved.${plain}"
+        echo -e "${yellow}Delete it in Pocket-ID first if you want to regenerate.${plain}"
         return 1
     fi
 
-    # Create client. clientSecret is returned ONCE at creation; capture immediately.
-    local create_body
-    create_body=$(cat <<EOF
-{"id":"${client_id}","name":"3x-ui @ ${host}","callbackURLs":["${callback}"],"isPublic":false,"pkceEnabled":true}
-EOF
-)
-    local create_resp
-    create_resp=$(curl -sS -X POST "${issuer}/api/oidc/clients" \
-        -H "X-API-Key: ${api_key}" \
-        -H "Content-Type: application/json" \
-        -d "${create_body}")
+    # Build JSON request body with proper escaping so host/callback never inject.
+    local esc_id esc_name esc_cb create_body
+    esc_id=$(_json_escape "$client_id")
+    esc_name=$(_json_escape "3x-ui @ $host")
+    esc_cb=$(_json_escape "$callback")
+    create_body=$(printf '{"id":%s,"name":%s,"callbackURLs":[%s],"isPublic":false,"pkceEnabled":true}' \
+        "$esc_id" "$esc_name" "$esc_cb")
 
-    local secret
-    secret=$(echo "$create_resp" | grep -oE '"clientSecret"[[:space:]]*:[[:space:]]*"[^"]+"' | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')
+    # POST to create the client.
+    local create_out=$(mktemp)
+    # shellcheck disable=SC2064
+    trap "rm -f '$_cfg_list' '$_cfg_post' '$list_out' '$create_out'" RETURN
+    local create_code
+    create_code=$(curl -sS -o "$create_out" -w '%{http_code}' -K "$_cfg_post" \
+        --data-binary "${create_body}" "${issuer}/api/oidc/clients" || echo "000")
+
+    if [[ "$create_code" != "200" && "$create_code" != "201" ]]; then
+        echo -e "${red}Pocket-ID create client failed (HTTP ${create_code}).${plain}"
+        echo -e "${red}Check API key privileges and the issuer logs.${plain}"
+        return 1
+    fi
+
+    local secret=""
+    if command -v jq >/dev/null 2>&1; then
+        secret=$(jq -r '.credentials.clientSecret // .clientSecret // empty' "$create_out" 2>/dev/null)
+    fi
     if [[ -z "$secret" ]]; then
-        echo -e "${red}Failed to extract clientSecret from Pocket-ID response.${plain}"
-        echo -e "${red}Response: ${create_resp}${plain}"
+        secret=$(grep -oE '"clientSecret"[[:space:]]*:[[:space:]]*"[^"]+"' "$create_out" | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')
+    fi
+    if [[ -z "$secret" ]]; then
+        echo -e "${red}Created OIDC client but could not extract clientSecret from the response.${plain}"
+        echo -e "${red}Delete client '${client_id}' in Pocket-ID and re-run installer.${plain}"
+        # Deliberately do NOT echo the response body — it may contain the secret.
         return 1
     fi
 
-    # Pick the right EnvironmentFile path for the OS family.
+    # Pick the systemd EnvironmentFile path for this OS family. x-ui.service.rhel
+    # reads /etc/sysconfig/x-ui, not /etc/default/x-ui.
     local env_file="/etc/default/x-ui"
     case "${release}" in
         arch | manjaro | parch) env_file="/etc/conf.d/x-ui" ;;
+        centos | rhel | fedora | amzn | virtuozzo | almalinux | rocky | ol)
+            env_file="/etc/sysconfig/x-ui" ;;
     esac
 
-    umask 077
-    cat > "${env_file}" <<EOF
-# Generated by 3x-ui install.sh — Pocket-ID (OIDC) SSO
-XUI_OIDC_ISSUER=${issuer}
-XUI_OIDC_CLIENT_ID=${client_id}
-XUI_OIDC_CLIENT_SECRET=${secret}
-XUI_OIDC_REDIRECT_URL=${callback}
-XUI_OIDC_USERNAME_CLAIM=email
-XUI_OIDC_AUTO_CREATE=false
-EOF
-    chmod 600 "${env_file}"
-    umask 022
+    # Back up any existing env file so unrelated admin-placed values survive.
+    if [[ -f "$env_file" ]]; then
+        local backup
+        backup="${env_file}.bak.$(date +%Y%m%d%H%M%S)"
+        cp -a "$env_file" "$backup" && chmod 600 "$backup"
+        echo -e "${yellow}Existing ${env_file} backed up to ${backup}${plain}"
+    fi
 
-    # Restart so the running x-ui picks up the new env vars.
+    # Atomic write: stage to a tempfile in the same directory, then rename. This
+    # avoids truncated writes if the process is killed mid-write.
+    local env_dir env_tmp
+    env_dir=$(dirname "$env_file")
+    mkdir -p "$env_dir"
+    env_tmp=$(mktemp "${env_file}.XXXXXX")
+    chmod 600 "$env_tmp"
+
+    {
+        printf '# Generated by 3x-ui install.sh — Pocket-ID (OIDC) SSO\n'
+        printf 'XUI_OIDC_ISSUER=%s\n'         "$(_systemd_env_escape "$issuer")"
+        printf 'XUI_OIDC_CLIENT_ID=%s\n'      "$(_systemd_env_escape "$client_id")"
+        printf 'XUI_OIDC_CLIENT_SECRET=%s\n'  "$(_systemd_env_escape "$secret")"
+        printf 'XUI_OIDC_REDIRECT_URL=%s\n'   "$(_systemd_env_escape "$callback")"
+        printf 'XUI_OIDC_USERNAME_CLAIM=%s\n' "$(_systemd_env_escape "email")"
+        printf 'XUI_OIDC_AUTO_CREATE=%s\n'    "$(_systemd_env_escape "false")"
+        printf 'XUI_OIDC_ALLOW_USERNAME_BACKFILL=%s\n' "$(_systemd_env_escape "true")"
+        printf 'XUI_OIDC_REQUIRE_EMAIL_VERIFIED=%s\n'  "$(_systemd_env_escape "true")"
+    } > "$env_tmp"
+    mv -f "$env_tmp" "$env_file"
+    chmod 600 "$env_file"
+
+    # Restart and verify the service came back healthy. A silent restart failure
+    # (bad env format, port conflict, etc.) would look like success to the user.
+    local restart_ok=1
     if [[ "${release}" == "alpine" ]]; then
-        rc-service x-ui restart >/dev/null 2>&1 || true
+        rc-service x-ui restart >/dev/null 2>&1 || restart_ok=0
     else
-        systemctl restart x-ui >/dev/null 2>&1 || true
+        systemctl restart x-ui >/dev/null 2>&1 || restart_ok=0
+    fi
+
+    sleep 1
+    local active=0
+    if [[ "${release}" == "alpine" ]]; then
+        rc-service x-ui status >/dev/null 2>&1 && active=1
+    else
+        systemctl is-active --quiet x-ui && active=1
+    fi
+    if [[ "$active" -ne 1 || "$restart_ok" -ne 1 ]]; then
+        echo -e "${red}x-ui failed to come back up after SSO config write.${plain}"
+        echo -e "${red}Inspect logs: journalctl -u x-ui -n 100  (or  rc-service x-ui status).${plain}"
+        return 1
     fi
 
     echo ""
@@ -917,8 +1057,9 @@ EOF
     echo -e "${green}Client ID:   ${client_id}${plain}"
     echo -e "${green}Callback:    ${callback}${plain}"
     echo -e "${green}Env file:    ${env_file}${plain}"
-    echo -e "${yellow}Binding tip: sign in once with username/password, then sign in with SSO${plain}"
-    echo -e "${yellow}using the email that matches your panel username to backfill the binding.${plain}"
+    echo -e "${yellow}First SSO login needs to match the current admin username (email-based${plain}"
+    echo -e "${yellow}backfill is enabled). Disable 2FA on the panel first — SSO is blocked${plain}"
+    echo -e "${yellow}while TOTP 2FA is active to prevent bypassing it.${plain}"
     echo -e "${green}═══════════════════════════════════════════${plain}"
 }
 

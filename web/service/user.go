@@ -128,79 +128,109 @@ func (s *UserService) UpdateUser(id int, username string, password string) error
 		Error
 }
 
+// OIDCLinkPolicy configures how GetOrLinkOIDCUser resolves the local user for
+// an IdP-authenticated identity. Default (zero value) is the safe option:
+// only match a user whose oidc_subject already equals `subject`. Any first-time
+// binding must be explicitly opted into with AllowUsernameBackfill or AutoCreate.
+type OIDCLinkPolicy struct {
+	// AllowUsernameBackfill lets an IdP-authenticated call link an existing
+	// password-only user row whose `username` equals the supplied fallback.
+	// Off by default to prevent takeover when the IdP is not a trust boundary.
+	AllowUsernameBackfill bool
+
+	// AutoCreate lets an IdP-authenticated call create a brand new panel user
+	// when no binding exists. 3x-ui has no role system — a created user is a
+	// full admin. Off by default. When on, the caller SHOULD restrict access
+	// to the IdP side (e.g. Pocket-ID user group restrictions).
+	AutoCreate bool
+}
+
 // GetOrLinkOIDCUser resolves the local user bound to the given OIDC subject.
 //
-// The lookup is in three steps:
-//  1. Match an existing user whose oidc_subject equals `subject` (stable across IdP email changes).
-//  2. Fall back to matching an existing user whose username equals `fallbackUsername` AND whose
-//     oidc_subject is empty. This is the one-time migration for admins who signed up with
-//     password auth before SSO was enabled; the subject is backfilled on that row.
-//  3. If autoCreate is true and no match is found, a new user is created with Username =
-//     fallbackUsername, OIDCSubject = subject, and a random password (effectively SSO-only).
+// Resolution order, all inside a single DB transaction to avoid a concurrent
+// callback racing itself to a duplicate row:
+//  1. Match by oidc_subject = subject (the stable binding, unaffected by IdP
+//     email/username changes).
+//  2. If policy.AllowUsernameBackfill, match by username = fallbackUsername
+//     where the existing row has NULL oidc_subject; backfill the subject.
+//  3. If policy.AutoCreate, create a new user with a random password and the
+//     subject attached.
 //
-// Returns an error when no match is found and autoCreate is false, or when the fallback
-// username exists but is already bound to a different OIDC subject (prevents takeover).
-func (s *UserService) GetOrLinkOIDCUser(subject string, fallbackUsername string, autoCreate bool) (*model.User, error) {
+// Returns an error when nothing matches and no policy permits creation/link,
+// or when the fallback username is already bound to a *different* subject.
+func (s *UserService) GetOrLinkOIDCUser(subject string, fallbackUsername string, policy OIDCLinkPolicy) (*model.User, error) {
 	if subject == "" {
 		return nil, errors.New("empty oidc subject")
 	}
 	db := database.GetDB()
 
-	user := &model.User{}
-	err := db.Model(&model.User{}).Where("oidc_subject = ?", subject).First(user).Error
-	if err == nil {
-		return user, nil
-	}
-	if !errors.Is(err, gorm.ErrRecordNotFound) {
-		logger.Warning("oidc user lookup by subject err:", err)
-		return nil, err
-	}
-
-	if fallbackUsername != "" {
-		byName := &model.User{}
-		err = db.Model(&model.User{}).Where("username = ?", fallbackUsername).First(byName).Error
+	var result *model.User
+	err := db.Transaction(func(tx *gorm.DB) error {
+		bySub := &model.User{}
+		err := tx.Model(&model.User{}).Where("oidc_subject = ?", subject).First(bySub).Error
 		if err == nil {
-			if byName.OIDCSubject != "" && byName.OIDCSubject != subject {
-				return nil, errors.New("username already bound to a different SSO identity")
-			}
-			byName.OIDCSubject = subject
-			if err := db.Save(byName).Error; err != nil {
-				logger.Warning("oidc subject backfill err:", err)
-				return nil, err
-			}
-			return byName, nil
+			result = bySub
+			return nil
 		}
 		if !errors.Is(err, gorm.ErrRecordNotFound) {
-			logger.Warning("oidc user lookup by username err:", err)
-			return nil, err
+			logger.Warning("oidc user lookup by subject err:", err)
+			return err
 		}
-	}
 
-	if !autoCreate {
-		return nil, errors.New("no local account bound to this SSO identity")
-	}
+		if policy.AllowUsernameBackfill && fallbackUsername != "" {
+			byName := &model.User{}
+			err = tx.Model(&model.User{}).Where("username = ?", fallbackUsername).First(byName).Error
+			if err == nil {
+				if byName.OIDCSubject != nil && *byName.OIDCSubject != "" && *byName.OIDCSubject != subject {
+					return errors.New("username already bound to a different SSO identity")
+				}
+				sub := subject
+				byName.OIDCSubject = &sub
+				if err := tx.Save(byName).Error; err != nil {
+					logger.Warning("oidc subject backfill err:", err)
+					return err
+				}
+				result = byName
+				return nil
+			}
+			if !errors.Is(err, gorm.ErrRecordNotFound) {
+				logger.Warning("oidc user lookup by username err:", err)
+				return err
+			}
+		}
 
-	pwBytes := make([]byte, 24)
-	if _, rerr := rand.Read(pwBytes); rerr != nil {
-		return nil, rerr
-	}
-	randomPassword := base64.RawURLEncoding.EncodeToString(pwBytes)
-	hashed, herr := crypto.HashPasswordAsBcrypt(randomPassword)
-	if herr != nil {
-		return nil, herr
-	}
-	newUser := &model.User{
-		Username:    fallbackUsername,
-		Password:    hashed,
-		OIDCSubject: subject,
-	}
-	if newUser.Username == "" {
-		newUser.Username = "sso-" + subject
-	}
-	if err := db.Create(newUser).Error; err != nil {
+		if !policy.AutoCreate {
+			return errors.New("no local account bound to this SSO identity")
+		}
+
+		pwBytes := make([]byte, 24)
+		if _, rerr := rand.Read(pwBytes); rerr != nil {
+			return rerr
+		}
+		randomPassword := base64.RawURLEncoding.EncodeToString(pwBytes)
+		hashed, herr := crypto.HashPasswordAsBcrypt(randomPassword)
+		if herr != nil {
+			return herr
+		}
+		sub := subject
+		newUser := &model.User{
+			Username:    fallbackUsername,
+			Password:    hashed,
+			OIDCSubject: &sub,
+		}
+		if newUser.Username == "" {
+			newUser.Username = "sso-" + subject
+		}
+		if err := tx.Create(newUser).Error; err != nil {
+			return err
+		}
+		result = newUser
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return newUser, nil
+	return result, nil
 }
 
 func (s *UserService) UpdateFirstUser(username string, password string) error {
