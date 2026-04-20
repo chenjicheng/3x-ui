@@ -1,0 +1,74 @@
+name: E2E SSO Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build x-ui
+        run: go build -o x-ui-ci .
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install mock OIDC dependencies
+        run: pip install "PyJWT>=2.8" "cryptography>=42"
+
+      - name: Start mock OIDC server
+        run: python3 e2e/mock_oidc.py &
+
+      - name: Wait for mock OIDC to be ready
+        run: |
+          timeout 15 bash -c \
+            'until curl -sf http://localhost:9998/.well-known/openid-configuration; do sleep 0.5; done'
+
+      - name: Initialise x-ui admin account
+        run: ./x-ui-ci setting -username ci-admin -password ci-pass-2024
+
+      - name: Start x-ui with SSO config
+        env:
+          XUI_OIDC_ISSUER: http://localhost:9998
+          XUI_OIDC_CLIENT_ID: 3x-ui-e2e
+          XUI_OIDC_CLIENT_SECRET: ci-secret
+          XUI_OIDC_REDIRECT_URL: http://localhost:2053/oidc/callback
+        run: ./x-ui-ci &
+
+      - name: Wait for x-ui to be ready
+        run: |
+          timeout 30 bash -c 'until curl -sf http://localhost:2053/; do sleep 1; done'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          cd e2e
+          npm ci
+          npx playwright install chromium --with-deps
+
+      - name: Run E2E SSO tests
+        run: cd e2e && npx playwright test
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: e2e/playwright-report/
+          retention-days: 7
