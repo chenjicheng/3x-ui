@@ -223,6 +223,10 @@ func (a *OIDCController) callback(c *gin.Context) {
 		a.fail(c, http.StatusBadRequest, "invalid or expired SSO state", errors.New("state mismatch"))
 		return
 	}
+	if expectedNonce == "" {
+		a.fail(c, http.StatusBadRequest, "invalid or expired SSO nonce", errors.New("nonce missing"))
+		return
+	}
 	code := c.Query("code")
 	if code == "" {
 		a.fail(c, http.StatusBadRequest, "missing code", nil)

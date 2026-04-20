@@ -101,8 +101,15 @@ class Handler(BaseHTTPRequestHandler):
             redirect_uri = (qs.get("redirect_uri") or [""])[0]
             state = (qs.get("state") or [""])[0]
             nonce = (qs.get("nonce") or [""])[0]
+            code_challenge = (qs.get("code_challenge") or [""])[0]
+            code_challenge_method = (qs.get("code_challenge_method") or [""])[0]
             code = secrets.token_urlsafe(32)
-            _codes[code] = {"redirect_uri": redirect_uri, "nonce": nonce}
+            _codes[code] = {
+                "redirect_uri": redirect_uri,
+                "nonce": nonce,
+                "code_challenge": code_challenge,
+                "code_challenge_method": code_challenge_method,
+            }
             self._redirect(f"{redirect_uri}?code={code}&state={state}")
 
         elif p.path == "/jwks":
@@ -122,6 +129,25 @@ class Handler(BaseHTTPRequestHandler):
             if not info:
                 self._json({"error": "invalid_grant"}, 400)
                 return
+
+            # Validate redirect_uri matches the one used in /auth
+            redirect_uri = (params.get("redirect_uri") or [""])[0]
+            if redirect_uri != info["redirect_uri"]:
+                self._json({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, 400)
+                return
+
+            # Validate PKCE code_verifier against stored code_challenge
+            code_verifier = (params.get("code_verifier") or [""])[0]
+            if info.get("code_challenge"):
+                if not code_verifier:
+                    self._json({"error": "invalid_grant", "error_description": "missing code_verifier"}, 400)
+                    return
+                import hashlib
+                digest = hashlib.sha256(code_verifier.encode()).digest()
+                computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
+                if computed != info["code_challenge"]:
+                    self._json({"error": "invalid_grant", "error_description": "code_verifier mismatch"}, 400)
+                    return
 
             client_id = (params.get("client_id") or ["3x-ui-e2e"])[0]
             now = int(time.time())
