@@ -93,12 +93,13 @@
                     {{ if .oidc_enabled }}
                     <a-form-item>
                       <a-row justify="center" class="centered">
-                        <a href="{{ .base_path }}oidc/login"
-                           class="ant-btn ant-btn-primary ant-btn-lg ant-btn-block"
-                           style="display: flex; align-items: center; justify-content: center; gap: 6px; width: 100%;">
-                          <i class="anticon anticon-safety-certificate"></i>
-                          <span>{{ i18n "pages.login.ssoLogin" }}</span>
-                        </a>
+                        <div class="wave-btn-bg wave-btn-bg-cl h-50px mt-1rem"
+                          style="display: inline-block">
+                          <a-button class="ant-btn-primary-login" type="primary"
+                            :href="'{{ .base_path }}oidc/login'" block>
+                            {{ i18n "pages.login.ssoLogin" }}
+                          </a-button>
+                        </div>
                       </a-row>
                     </a-form-item>
                     {{ end }}
