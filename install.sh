@@ -1010,17 +1010,32 @@ configure_sso() {
         return 1
     fi
 
+    # Pocket-ID's create endpoint returns the client DTO without a secret.
+    # A separate POST to /clients/{id}/secret generates it (one-time only).
+    local _cfg_post_bare="$SSO_TMPDIR/cfg_post_bare"
+    local secret_out="$SSO_TMPDIR/secret_out"
+    ( umask 077; printf 'header = "X-API-Key: %s"\nrequest = "POST"\n' "$api_key_esc" > "$_cfg_post_bare" )
+
+    local secret_code
+    secret_code=$(curl -sS -o "$secret_out" -w '%{http_code}' -K "$_cfg_post_bare" \
+        "${issuer}/api/oidc/clients/${client_id}/secret" || echo "000")
+
+    if [[ "$secret_code" != "200" && "$secret_code" != "201" ]]; then
+        echo -e "${red}Pocket-ID /secret endpoint failed (HTTP ${secret_code}).${plain}"
+        echo -e "${red}Client '${client_id}' was created. Delete it in Pocket-ID and re-run.${plain}"
+        return 1
+    fi
+
     local secret=""
     if command -v jq >/dev/null 2>&1; then
-        secret=$(jq -r '.credentials.clientSecret // .clientSecret // empty' "$create_out" 2>/dev/null)
+        secret=$(jq -r '.secret // empty' "$secret_out" 2>/dev/null)
     fi
     if [[ -z "$secret" ]]; then
-        secret=$(grep -oE '"clientSecret"[[:space:]]*:[[:space:]]*"[^"]+"' "$create_out" | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')
+        secret=$(grep -oE '"secret"[[:space:]]*:[[:space:]]*"[^"]+"' "$secret_out" | head -n1 | sed -E 's/.*"([^"]+)"$/\1/')
     fi
     if [[ -z "$secret" ]]; then
-        echo -e "${red}Created OIDC client but could not extract clientSecret from the response.${plain}"
+        echo -e "${red}Could not extract secret from Pocket-ID /secret response.${plain}"
         echo -e "${red}Delete client '${client_id}' in Pocket-ID and re-run installer.${plain}"
-        # Deliberately do NOT echo the response body — it may contain the secret.
         return 1
     fi
 
