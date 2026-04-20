@@ -102,29 +102,6 @@
                         <span>{{ i18n "pages.login.ssoLogin" }}</span>
                       </a>
                     </a-form-item>
-                    <style>
-                      /* Pocket-ID / shadcn zinc aesthetic: near-black in light,
-                         near-white in dark. Flat, no border, subtle hover. */
-                      .x-sso-btn {
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        gap: 8px;
-                        width: 100%;
-                        height: 44px;
-                        border-radius: 10px;
-                        font-weight: 500;
-                        font-size: 14px;
-                        background: #18181b;
-                        color: #fafafa !important;
-                        transition: background 0.15s ease;
-                      }
-                      .x-sso-btn:hover { background: #27272a; color: #fafafa !important; }
-                      .x-sso-btn:focus { outline: 2px solid #71717a; outline-offset: 2px; }
-                      .theme_dark .x-sso-btn { background: #fafafa; color: #18181b !important; }
-                      .theme_dark .x-sso-btn:hover { background: #e4e4e7; color: #18181b !important; }
-                      .theme_dark .x-sso-btn:focus { outline-color: #a1a1aa; }
-                    </style>
                     {{ end }}
                   </a-space>
                 </a-form>
@@ -136,6 +113,29 @@
     </a-layout-content>
   </transition>
 </a-layout>
+{{ if .oidc_enabled }}
+<style>
+  .x-sso-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    height: 44px;
+    border-radius: 10px;
+    font-weight: 500;
+    font-size: 14px;
+    background: #18181b;
+    color: #fafafa !important;
+    transition: background 0.15s ease;
+  }
+  .x-sso-btn:hover { background: #27272a; color: #fafafa !important; }
+  .x-sso-btn:focus { outline: 2px solid #71717a; outline-offset: 2px; }
+  .theme_dark .x-sso-btn { background: #fafafa; color: #18181b !important; }
+  .theme_dark .x-sso-btn:hover { background: #e4e4e7; color: #18181b !important; }
+  .theme_dark .x-sso-btn:focus { outline-color: #a1a1aa; }
+</style>
+{{ end }}
 {{template "page/body_scripts" .}}
 {{template "component/aThemeSwitch" .}}
 <script>
