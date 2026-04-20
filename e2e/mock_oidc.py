@@ -4,6 +4,7 @@ Minimal OIDC Authorization Code + PKCE mock server.
 Auto-grants all auth requests without user interaction.
 For CI testing only — never use in production.
 """
+import hashlib
 import json
 import time
 import secrets
@@ -136,13 +137,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, 400)
                 return
 
-            # Validate PKCE code_verifier against stored code_challenge
+            # Validate PKCE code_verifier against stored code_challenge (S256 only)
             code_verifier = (params.get("code_verifier") or [""])[0]
             if info.get("code_challenge"):
                 if not code_verifier:
                     self._json({"error": "invalid_grant", "error_description": "missing code_verifier"}, 400)
                     return
-                import hashlib
+                if info.get("code_challenge_method", "S256") != "S256":
+                    self._json({"error": "invalid_request", "error_description": "unsupported code_challenge_method"}, 400)
+                    return
                 digest = hashlib.sha256(code_verifier.encode()).digest()
                 computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode()
                 if computed != info["code_challenge"]:

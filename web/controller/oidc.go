@@ -227,6 +227,10 @@ func (a *OIDCController) callback(c *gin.Context) {
 		a.fail(c, http.StatusBadRequest, "invalid or expired SSO nonce", errors.New("nonce missing"))
 		return
 	}
+	if pkce == "" {
+		a.fail(c, http.StatusBadRequest, "invalid or expired SSO session", errors.New("pkce verifier missing"))
+		return
+	}
 	code := c.Query("code")
 	if code == "" {
 		a.fail(c, http.StatusBadRequest, "missing code", nil)
