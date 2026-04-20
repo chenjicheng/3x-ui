@@ -91,16 +91,19 @@
                       </a-row>
                     </a-form-item>
                     {{ if .oidc_enabled }}
-                    <a-form-item>
-                      <a-row justify="center" class="centered">
-                        <div class="wave-btn-bg wave-btn-bg-cl h-50px mt-1rem"
-                          style="display: inline-block">
-                          <a-button class="ant-btn-primary-login" type="primary"
-                            :href="'{{ .base_path }}oidc/login'" block>
-                            {{ i18n "pages.login.ssoLogin" }}
-                          </a-button>
-                        </div>
-                      </a-row>
+                    <a-form-item style="margin-top: 4px; margin-bottom: 0;">
+                      <a-button size="large" block ghost type="primary"
+                        :href="'{{ .base_path }}oidc/login'"
+                        style="height: 44px; border-radius: 10px; font-weight: 500; display: inline-flex; align-items: center; justify-content: center; gap: 8px;">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18"
+                          viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                          stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                          style="flex-shrink: 0;">
+                          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                        </svg>
+                        <span>{{ i18n "pages.login.ssoLogin" }}</span>
+                      </a-button>
                     </a-form-item>
                     {{ end }}
                   </a-space>
